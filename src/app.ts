@@ -2,12 +2,14 @@ import { Telegraf, Context } from "telegraf";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
+import * as http from "http";
 
 dotenv.config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SEND_DELAY_MS = parseInt(process.env.SEND_DELAY_MS || "3000", 10);
 const ADMIN_ID = parseInt(process.env.ADMIN_ID || "0", 10);
+const PORT = parseInt(process.env.PORT || "3000", 10);
 const DATA_FILE = path.join(process.cwd(), "data.json");
 const DEFAULT_DATA: UserData[] = [
   {
@@ -656,6 +658,27 @@ bot.telegram
   .then(() => {
     botReady = true;
     console.log("✅ Forwarding Bot is running...");
+
+    // Servidor HTTP para Render (requiere que el servicio escuche en un puerto)
+    const server = http.createServer((req, res) => {
+      if (req.url === "/" || req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            status: "ok",
+            bot: botEnabled ? "enabled" : "disabled",
+            timestamp: new Date().toISOString(),
+          }),
+        );
+      } else {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("Not Found");
+      }
+    });
+
+    server.listen(PORT, () => {
+      console.log(`🌐 HTTP Server listening on port ${PORT}`);
+    });
   })
   .catch((err: Error) => {
     console.error("❌ Failed to start bot:", err);
