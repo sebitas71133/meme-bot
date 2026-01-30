@@ -192,37 +192,6 @@ async function isAdmin(userId: number): Promise<boolean> {
   return false;
 }
 
-async function upsertUserInfo(ctx: Context): Promise<void> {
-  if (!mongoReady || !ctx.from) return;
-
-  const { id, first_name, username } = ctx.from;
-  
-  // Check if user exists and if data has changed
-  const existingUser = await UserModel.findOne({ userId: id });
-  
-  // Only update if user doesn't exist or data has changed
-  if (!existingUser || 
-      existingUser.firstName !== first_name || 
-      existingUser.username !== username) {
-    await UserModel.updateOne(
-      { userId: id },
-      {
-        $set: {
-          firstName: first_name,
-          username,
-        },
-      },
-      { upsert: true },
-    );
-  }
-}
-
-// Middleware: persist user info on every update
-bot.use(async (ctx, next) => {
-  await upsertUserInfo(ctx);
-  return next();
-});
-
 // Notify all users about bot status
 async function notifyAllUsers(message: string): Promise<void> {
   const users = await getAllUsers();
@@ -327,6 +296,28 @@ async function sendMediaGroup(
 
 // /start command
 bot.command("start", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+
+  // Save user info to database on first interaction
+  if (userId && mongoReady) {
+    try {
+      const { first_name, username } = ctx.from;
+      await UserModel.updateOne(
+        { userId },
+        {
+          $set: {
+            firstName: first_name,
+            username,
+          },
+        },
+        { upsert: true },
+      );
+      console.log(`[USER] Registered/updated user ${userId}`);
+    } catch (e) {
+      console.error(`[ERROR] Failed to save user ${userId}:`, e);
+    }
+  }
+
   await ctx.reply(
     "Welcome! 👋\n\n" +
       "Use /set_target <user_id> to specify who receives your media.\n" +
