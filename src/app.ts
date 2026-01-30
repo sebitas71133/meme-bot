@@ -942,10 +942,15 @@ bot.telegram
     { command: "change_target", description: "<id> - Update recipient" },
     { command: "status", description: "Check bot status" },
     { command: "live", description: "Check if bot is awake" },
+    { command: "mystats", description: "Show my profile" },
     { command: "stats", description: "Show user stats (Admin)" },
     { command: "reply", description: "<id> <message> - Send message" },
     { command: "power_on", description: "Turn bot ON (Admin only)" },
     { command: "power_off", description: "Turn bot OFF (Admin only)" },
+    {
+      command: "promote",
+      description: "<id> - Promote user to admin (Super-admin)",
+    },
     { command: "help", description: "Show all commands" },
   ])
   .then(() => {
