@@ -529,17 +529,17 @@ bot.command("help", async (ctx: Context) => {
   await ctx.reply(
     "<b>📋 Available Commands:</b>\n\n" +
       "🚀 /start - Welcome message\n" +
-      "🎯 /set_target <id> - Set media recipient\n" +
+      "🎯 /set_target &lt;id&gt; - Set media recipient\n" +
       "📍 /get_target - Show current recipient\n" +
-      "🔄 /change_target <id> - Update recipient\n" +
+      "🔄 /change_target &lt;id&gt; - Update recipient\n" +
       "📡 /status - Check bot status\n" +
       "🟢 /live - Check if bot is awake\n" +
       "👤 /mystats - Show my profile (username, ID, admin status)\n" +
       "📊 /stats - Show user stats (Admin only)\n" +
-      "✉️ /reply <id> <message> - Send message\n" +
+      "✉️ /reply &lt;id&gt; &lt;message&gt; - Send message\n" +
       "🔐 /power_on - Turn bot ON (Admin only)\n" +
       "🔒 /power_off - Turn bot OFF (Admin only)\n" +
-      "👑 /promote <id> - Promote user to admin (Super-admin only)\n" +
+      "👑 /promote &lt;id&gt; - Promote user to admin (Super-admin only)\n" +
       "❓ /help - Show this message",
     { parse_mode: "HTML" },
   );
