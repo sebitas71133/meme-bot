@@ -60,6 +60,7 @@ interface UserDoc {
   firstName?: string;
   username?: string;
   targetId?: number;
+  isAdmin?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -70,6 +71,7 @@ const userSchema = new mongoose.Schema<UserDoc>(
     firstName: { type: String },
     username: { type: String },
     targetId: { type: Number },
+    isAdmin: { type: Boolean, default: false },
   },
   { timestamps: true },
 );
@@ -177,6 +179,17 @@ async function isRegisteredUser(userId: number): Promise<boolean> {
 
   const data = loadData();
   return data.some((u) => u.userId === userId || u.targetId === userId);
+}
+
+async function isAdmin(userId: number): Promise<boolean> {
+  if (userId === ADMIN_ID) return true;
+
+  if (mongoReady) {
+    const user = await UserModel.findOne({ userId }).lean();
+    return user?.isAdmin ?? false;
+  }
+
+  return false;
 }
 
 async function upsertUserInfo(ctx: Context): Promise<void> {
@@ -317,8 +330,10 @@ bot.command("start", async (ctx: Context) => {
 // /power_on command (Admin only)
 bot.command("power_on", async (ctx: Context) => {
   const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
 
-  if (userId !== ADMIN_ID) {
+  if (!authorized) {
     return ctx.reply("❌ Unauthorized. Admin only.");
   }
 
@@ -336,8 +351,11 @@ bot.command("power_on", async (ctx: Context) => {
 // /power_off command (Admin only)
 bot.command("power_off", async (ctx: Context) => {
   const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
 
-  if (userId !== ADMIN_ID) {
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+
+  if (!authorized) {
     return ctx.reply("❌ Unauthorized. Admin only.");
   }
 
@@ -374,6 +392,7 @@ bot.command("live", async (ctx: Context) => {
 // /reply command
 bot.command("reply", async (ctx: Context) => {
   const senderId = ctx.from?.id;
+  const senderName = ctx.from?.first_name || "Unknown";
   if (!senderId) return;
 
   const registered = await isRegisteredUser(senderId);
@@ -401,13 +420,56 @@ bot.command("reply", async (ctx: Context) => {
   }
 
   try {
-    await ctx.telegram.sendMessage(targetId, text);
+    const fullMessage = `💬 <b>From ${senderName}:</b>\n\n${text}`;
+    await ctx.telegram.sendMessage(targetId, fullMessage, {
+      parse_mode: "HTML",
+    });
     return ctx.reply(`✅ Message sent to ${targetId}`);
   } catch (e: any) {
     console.error(`[ERROR] Failed to send message to ${targetId}:`, e);
     return ctx.reply(
       "❌ Failed to send message. Error: " +
         (e?.description || e?.message || "Unknown error"),
+    );
+  }
+});
+
+// /promote command (Super Admin only)
+bot.command("promote", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (userId !== ADMIN_ID) {
+    return ctx.reply("❌ Unauthorized. Super Admin only.");
+  }
+
+  const message = ctx.message as any;
+  if (!message?.text) {
+    return ctx.reply("Error: message is undefined");
+  }
+
+  const parts = message.text.split(" ");
+  const targetUserId = Number(parts[1]);
+
+  if (!targetUserId || isNaN(targetUserId)) {
+    return ctx.reply(
+      "Usage: /promote <tg_id>\n" + "Example: /promote 123456789",
+    );
+  }
+
+  if (!mongoReady) {
+    return ctx.reply("⚠️ MongoDB is not connected. Cannot promote users.");
+  }
+
+  try {
+    await UserModel.updateOne(
+      { userId: targetUserId },
+      { $set: { isAdmin: true } },
+      { upsert: true },
+    );
+    return ctx.reply(`✅ User ${targetUserId} promoted to Admin`);
+  } catch (e: any) {
+    console.error(`[ERROR] Failed to promote user ${targetUserId}:`, e);
+    return ctx.reply(
+      "❌ Failed to promote user. Error: " + (e?.message || "Unknown error"),
     );
   }
 });
@@ -426,6 +488,7 @@ bot.command("help", async (ctx: Context) => {
       "✉️ /reply &lt;id&gt; &lt;message&gt; - Send message\n" +
       "🔐 /power_on - Turn bot ON (Admin only)\n" +
       "🔒 /power_off - Turn bot OFF (Admin only)\n" +
+      "👑 /promote &lt;id&gt; - Promote user to admin (Super-admin only)\n" +
       "❓ /help - Show this message",
     { parse_mode: "HTML" },
   );
@@ -501,7 +564,11 @@ bot.command("change_target", async (ctx: Context) => {
 // /stats command (Admin only)
 bot.command("stats", async (ctx: Context) => {
   const userId = ctx.from?.id;
-  if (userId !== ADMIN_ID) {
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+
+  if (!authorized) {
     return ctx.reply("❌ Unauthorized. Admin only.");
   }
 
@@ -515,9 +582,10 @@ bot.command("stats", async (ctx: Context) => {
   const total = users.length;
 
   const lines = users.map((u, i) => {
+    const adminBadge = u.isAdmin ? " 👑" : "";
     const name = u.firstName || "Unknown";
     const handle = u.username ? ` (@${u.username})` : "";
-    return `${i + 1}. ${name}${handle}\n   ID: ${u.userId}`;
+    return `${i + 1}. ${name}${handle}${adminBadge}\n   ID: ${u.userId}`;
   });
 
   const message =
@@ -818,13 +886,13 @@ process.on("unhandledRejection", (reason: any) => {
 bot.telegram
   .setMyCommands([
     { command: "start", description: "Welcome message" },
-    { command: "set_target", description: "Set media recipient" },
+    { command: "set_target", description: "<id> - Set media recipient" },
     { command: "get_target", description: "Show current recipient" },
-    { command: "change_target", description: "Update recipient" },
+    { command: "change_target", description: "<id> - Update recipient" },
     { command: "status", description: "Check bot status" },
     { command: "live", description: "Check if bot is awake" },
     { command: "stats", description: "Show user stats (Admin)" },
-    { command: "reply", description: "Send message" },
+    { command: "reply", description: "<id> <message> - Send message" },
     { command: "power_on", description: "Turn bot ON (Admin only)" },
     { command: "power_off", description: "Turn bot OFF (Admin only)" },
     { command: "help", description: "Show all commands" },
