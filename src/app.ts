@@ -3,6 +3,7 @@ import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
 import * as http from "http";
+import mongoose from "mongoose";
 
 dotenv.config();
 
@@ -10,6 +11,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const SEND_DELAY_MS = parseInt(process.env.SEND_DELAY_MS || "3000", 10);
 const ADMIN_ID = parseInt(process.env.ADMIN_ID || "0", 10);
 const PORT = parseInt(process.env.PORT || "3000", 10);
+const MONGO_URI = process.env.MONGO_URI;
 const DATA_FILE = path.join(process.cwd(), "data.json");
 const DEFAULT_DATA: UserData[] = [
   {
@@ -31,6 +33,9 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
+// Connect to MongoDB (non-blocking)
+connectMongo();
+
 // Bot power state
 let botEnabled = true;
 let botReady = false;
@@ -47,6 +52,45 @@ interface UserData {
   userId: number;
   targetId: number;
   createdAt: string;
+}
+
+// MongoDB (users + targets)
+interface UserDoc {
+  userId: number;
+  firstName?: string;
+  username?: string;
+  targetId?: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const userSchema = new mongoose.Schema<UserDoc>(
+  {
+    userId: { type: Number, required: true, unique: true },
+    firstName: { type: String },
+    username: { type: String },
+    targetId: { type: Number },
+  },
+  { timestamps: true },
+);
+
+const UserModel = mongoose.model<UserDoc>("User", userSchema);
+let mongoReady = false;
+
+async function connectMongo(): Promise<void> {
+  if (!MONGO_URI) {
+    console.warn("MONGO_URI not set. Using local JSON fallback.");
+    return;
+  }
+
+  try {
+    await mongoose.connect(MONGO_URI);
+    mongoReady = true;
+    console.log("✅ Connected to MongoDB");
+  } catch (e) {
+    console.error("❌ MongoDB connection failed:", e);
+    mongoReady = false;
+  }
 }
 
 function loadData(): UserData[] {
@@ -69,13 +113,27 @@ function saveData(data: UserData[]): void {
   }
 }
 
-function findTarget(userId: number): number | null {
+async function findTarget(userId: number): Promise<number | null> {
+  if (mongoReady) {
+    const user = await UserModel.findOne({ userId }).lean();
+    return user?.targetId ?? null;
+  }
+
   const data = loadData();
   const user = data.find((u) => u.userId === userId);
   return user?.targetId ?? null;
 }
 
-function setTarget(userId: number, targetId: number): void {
+async function setTarget(userId: number, targetId: number): Promise<void> {
+  if (mongoReady) {
+    await UserModel.updateOne(
+      { userId },
+      { $set: { targetId } },
+      { upsert: true },
+    );
+    return;
+  }
+
   const data = loadData();
   const existing = data.findIndex((u) => u.userId === userId);
   if (existing >= 0) {
@@ -91,7 +149,17 @@ function setTarget(userId: number, targetId: number): void {
 }
 
 // Get all unique user IDs from data
-function getAllUsers(): number[] {
+async function getAllUsers(): Promise<number[]> {
+  if (mongoReady) {
+    const users = await UserModel.find().lean();
+    const userIds = new Set<number>();
+    users.forEach((entry) => {
+      userIds.add(entry.userId);
+      if (entry.targetId) userIds.add(entry.targetId);
+    });
+    return Array.from(userIds);
+  }
+
   const data = loadData();
   const userIds = new Set<number>();
   data.forEach((entry) => {
@@ -101,9 +169,41 @@ function getAllUsers(): number[] {
   return Array.from(userIds);
 }
 
+async function isRegisteredUser(userId: number): Promise<boolean> {
+  if (mongoReady) {
+    const user = await UserModel.findOne({ userId }).lean();
+    return !!user;
+  }
+
+  const data = loadData();
+  return data.some((u) => u.userId === userId || u.targetId === userId);
+}
+
+async function upsertUserInfo(ctx: Context): Promise<void> {
+  if (!mongoReady || !ctx.from) return;
+
+  const { id, first_name, username } = ctx.from;
+  await UserModel.updateOne(
+    { userId: id },
+    {
+      $set: {
+        firstName: first_name,
+        username,
+      },
+    },
+    { upsert: true },
+  );
+}
+
+// Middleware: persist user info on every update
+bot.use(async (ctx, next) => {
+  await upsertUserInfo(ctx);
+  return next();
+});
+
 // Notify all users about bot status
 async function notifyAllUsers(message: string): Promise<void> {
-  const users = getAllUsers();
+  const users = await getAllUsers();
   console.log(`[BROADCAST] Notifying ${users.length} users...`);
 
   for (const userId of users) {
@@ -271,6 +371,47 @@ bot.command("live", async (ctx: Context) => {
   return ctx.reply("🟢 Bot is online and ready.");
 });
 
+// /reply command
+bot.command("reply", async (ctx: Context) => {
+  const senderId = ctx.from?.id;
+  if (!senderId) return;
+
+  const registered = await isRegisteredUser(senderId);
+  if (!registered) {
+    return ctx.reply(
+      "❌ You must be registered to use /reply.\n" +
+        "Use /start first and set a target with /set_target.",
+    );
+  }
+
+  const message = ctx.message as any;
+  if (!message?.text) {
+    return ctx.reply("Error: message is undefined");
+  }
+
+  const parts = message.text.split(" ");
+  const targetId = Number(parts[1]);
+  const text = parts.slice(2).join(" ").trim();
+
+  if (!targetId || isNaN(targetId) || !text) {
+    return ctx.reply(
+      "Usage: /reply <tg_id> <message>\n" +
+        "Example: /reply 123456789 Hola, ¿cómo estás?",
+    );
+  }
+
+  try {
+    await ctx.telegram.sendMessage(targetId, text);
+    return ctx.reply(`✅ Message sent to ${targetId}`);
+  } catch (e: any) {
+    console.error(`[ERROR] Failed to send message to ${targetId}:`, e);
+    return ctx.reply(
+      "❌ Failed to send message. Error: " +
+        (e?.description || e?.message || "Unknown error"),
+    );
+  }
+});
+
 // /help command
 bot.command("help", async (ctx: Context) => {
   await ctx.reply(
@@ -281,6 +422,8 @@ bot.command("help", async (ctx: Context) => {
       "🔄 /change_target &lt;id&gt; - Update recipient\n" +
       "📡 /status - Check bot status\n" +
       "🟢 /live - Check if bot is awake\n" +
+      "📊 /stats - Show user stats (Admin only)\n" +
+      "✉️ /reply &lt;id&gt; &lt;message&gt; - Send message\n" +
       "🔐 /power_on - Turn bot ON (Admin only)\n" +
       "🔒 /power_off - Turn bot OFF (Admin only)\n" +
       "❓ /help - Show this message",
@@ -308,7 +451,7 @@ bot.command("set_target", async (ctx: Context) => {
     );
   }
 
-  setTarget(userId, targetId);
+  await setTarget(userId, targetId);
   await ctx.reply(
     `✅ Target set to: ${targetId}\n\n` +
       "All media you send will now be forwarded to this user.",
@@ -320,7 +463,7 @@ bot.command("get_target", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  const target = findTarget(userId);
+  const target = await findTarget(userId);
   if (!target) {
     return ctx.reply(
       "❌ No target set.\n" +
@@ -351,8 +494,37 @@ bot.command("change_target", async (ctx: Context) => {
     );
   }
 
-  setTarget(userId, targetId);
+  await setTarget(userId, targetId);
   await ctx.reply(`✅ Target updated to: ${targetId}`);
+});
+
+// /stats command (Admin only)
+bot.command("stats", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (userId !== ADMIN_ID) {
+    return ctx.reply("❌ Unauthorized. Admin only.");
+  }
+
+  if (!mongoReady) {
+    return ctx.reply(
+      "⚠️ MongoDB is not connected. Stats are unavailable right now.",
+    );
+  }
+
+  const users = await UserModel.find().sort({ createdAt: 1 }).lean();
+  const total = users.length;
+
+  const lines = users.map((u, i) => {
+    const name = u.firstName || "Unknown";
+    const handle = u.username ? ` (@${u.username})` : "";
+    return `${i + 1}. ${name}${handle}\n   ID: ${u.userId}`;
+  });
+
+  const message =
+    `📊 User Stats\nTotal Active Users: ${total}` +
+    (lines.length ? `\n\n${lines.join("\n\n")}` : "");
+
+  return ctx.reply(message);
 });
 
 // Photo handler
@@ -372,7 +544,7 @@ bot.on("photo", async (ctx: Context) => {
     return ctx.reply("Error: photo message is undefined");
   }
 
-  const target = findTarget(userId);
+  const target = await findTarget(userId);
   if (!target) {
     return ctx.reply(
       "❌ No target configured.\n" + "Use /set_target <user_id> first.",
@@ -454,7 +626,7 @@ bot.on("video", async (ctx: Context) => {
     return ctx.reply("Error: video message is undefined");
   }
 
-  const target = findTarget(userId);
+  const target = await findTarget(userId);
   if (!target) {
     return ctx.reply(
       "❌ No target configured.\n" + "Use /set_target <user_id> first.",
@@ -536,7 +708,7 @@ bot.on("document", async (ctx: Context) => {
     return ctx.reply("Error: document message is undefined");
   }
 
-  const target = findTarget(userId);
+  const target = await findTarget(userId);
   if (!target) {
     return ctx.reply(
       "❌ No target configured.\n" + "Use /set_target <user_id> first.",
@@ -590,7 +762,7 @@ bot.on("audio", async (ctx: Context) => {
     return ctx.reply("Error: audio message is undefined");
   }
 
-  const target = findTarget(userId);
+  const target = await findTarget(userId);
   if (!target) {
     return ctx.reply(
       "❌ No target configured.\n" + "Use /set_target <user_id> first.",
@@ -651,6 +823,8 @@ bot.telegram
     { command: "change_target", description: "Update recipient" },
     { command: "status", description: "Check bot status" },
     { command: "live", description: "Check if bot is awake" },
+    { command: "stats", description: "Show user stats (Admin)" },
+    { command: "reply", description: "Send message" },
     { command: "power_on", description: "Turn bot ON (Admin only)" },
     { command: "power_off", description: "Turn bot OFF (Admin only)" },
     { command: "help", description: "Show all commands" },
