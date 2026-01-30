@@ -1,4 +1,5 @@
 import { Telegraf, Context } from "telegraf";
+import { InlineKeyboardButton } from "telegraf/types";
 import * as dotenv from "dotenv";
 import * as fs from "fs";
 import * as path from "path";
@@ -192,6 +193,30 @@ async function isAdmin(userId: number): Promise<boolean> {
   return false;
 }
 
+// Get all registered users with their info
+async function getAllRegisteredUsers(): Promise<
+  Array<{ userId: number; firstName?: string; username?: string }>
+> {
+  if (mongoReady) {
+    const users = await UserModel.find().lean();
+    return users.map((u) => ({
+      userId: u.userId,
+      firstName: u.firstName,
+      username: u.username,
+    }));
+  }
+
+  const data = loadData();
+  const userIds = new Set<number>();
+  data.forEach((entry) => {
+    userIds.add(entry.userId);
+  });
+  return Array.from(userIds).map((id) => ({
+    userId: id,
+    firstName: "Unknown",
+  }));
+}
+
 // Notify all users about bot status
 async function notifyAllUsers(message: string): Promise<void> {
   const users = await getAllUsers();
@@ -325,6 +350,45 @@ bot.command("start", async (ctx: Context) => {
       "Use /change_target <user_id> to update it.\n" +
       "Use /help for more info.",
   );
+});
+
+// /refresh_profile command
+bot.command("refresh_profile", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  if (!mongoReady) {
+    return ctx.reply(
+      "⚠️ MongoDB is not connected. Cannot refresh profile right now.",
+    );
+  }
+
+  try {
+    const { first_name, username } = ctx.from;
+    await UserModel.updateOne(
+      { userId },
+      {
+        $set: {
+          firstName: first_name,
+          username,
+        },
+      },
+      { upsert: true },
+    );
+
+    const displayName = first_name || "Unknown";
+    const displayUsername = username ? `@${username}` : "Not set";
+
+    await ctx.reply(
+      `✅ Profile refreshed!\n\n` +
+        `• Name: ${displayName}\n` +
+        `• Username: ${displayUsername}`,
+    );
+    console.log(`[USER] Refreshed profile for user ${userId}`);
+  } catch (error) {
+    console.error(`[ERROR] Failed to refresh profile for ${userId}:`, error);
+    return ctx.reply("❌ Failed to refresh profile. Try again later.");
+  }
 });
 
 // /power_on command (Admin only)
@@ -535,7 +599,8 @@ bot.command("help", async (ctx: Context) => {
       "📡 /status - Check bot status\n" +
       "🟢 /live - Check if bot is awake\n" +
       "👤 /mystats - Show my profile (username, ID, admin status)\n" +
-      "📊 /stats - Show user stats (Admin only)\n" +
+      "� /refresh_profile - Update profile data (name, username)\n" +
+      "�📊 /stats - Show user stats (Admin only)\n" +
       "✉️ /reply &lt;id&gt; &lt;message&gt; - Send message\n" +
       "🔐 /power_on - Turn bot ON (Admin only)\n" +
       "🔒 /power_off - Turn bot OFF (Admin only)\n" +
@@ -551,25 +616,82 @@ bot.command("set_target", async (ctx: Context) => {
   if (!userId) return;
 
   const message = ctx.message as any;
-  if (!message?.text) {
-    return ctx.reply("Error: message is undefined");
-  }
-
-  const parts = message.text.split(" ");
+  const parts = message?.text?.split(" ") || [];
   const targetId = Number(parts[1]);
 
-  if (!targetId || isNaN(targetId)) {
-    return ctx.reply(
-      "Please provide a valid target user ID.\n" +
-        "Usage: /set_target <user_id>",
-    );
+  // If user provided an ID, use it directly
+  if (targetId && !isNaN(targetId)) {
+    if (userId === targetId) {
+      return ctx.reply(
+        "❌ You can't set yourself as target!\n\n" +
+          "Please provide another user's ID.",
+      );
+    }
+
+    try {
+      const targetInfo = await bot.telegram.getChat(targetId);
+      const username = (targetInfo as any).username
+        ? `@${(targetInfo as any).username}`
+        : "N/A";
+      const firstName = (targetInfo as any).first_name || "Unknown";
+
+      await setTarget(userId, targetId);
+      await ctx.reply(
+        `✅ Target set successfully!\n\n` +
+          `📍 Forwarding to:\n` +
+          `• Name: ${firstName}\n` +
+          `• Username: ${username}\n` +
+          `• ID: ${targetId}\n\n` +
+          `All media you send will be forwarded to this user.`,
+      );
+    } catch (error) {
+      return ctx.reply(
+        "❌ Could not find user with that ID.\n\n" +
+          "Make sure the user ID is correct and the user has started the bot.",
+      );
+    }
+    return;
   }
 
-  await setTarget(userId, targetId);
-  await ctx.reply(
-    `✅ Target set to: ${targetId}\n\n` +
-      "All media you send will now be forwarded to this user.",
-  );
+  // If no ID provided, show list of users with buttons
+  try {
+    const users = await getAllRegisteredUsers();
+    const filtered = users.filter((u) => u.userId !== userId);
+
+    if (filtered.length === 0) {
+      return ctx.reply(
+        "❌ No other users available.\n\n" +
+          "Other users must start the bot first.",
+      );
+    }
+
+    const buttons: InlineKeyboardButton[][] = [];
+    for (let i = 0; i < filtered.length; i += 2) {
+      const row: InlineKeyboardButton[] = [];
+      for (let j = i; j < Math.min(i + 2, filtered.length); j++) {
+        const user = filtered[j];
+        const displayName =
+          user.firstName && user.firstName !== "Unknown"
+            ? user.firstName
+            : `User ${user.userId}`;
+        row.push({
+          text: displayName,
+          callback_data: `set_target_${user.userId}`,
+        });
+      }
+      buttons.push(row);
+    }
+
+    await ctx.reply("🎯 <b>Select a user to forward media to:</b>", {
+      reply_markup: { inline_keyboard: buttons },
+      parse_mode: "HTML",
+    });
+  } catch (error) {
+    console.error("[ERROR] Failed to fetch users:", error);
+    return ctx.reply(
+      "❌ Error loading users. Try providing a user ID manually.",
+    );
+  }
 });
 
 // /get_target command
@@ -580,12 +702,46 @@ bot.command("get_target", async (ctx: Context) => {
   const target = await findTarget(userId);
   if (!target) {
     return ctx.reply(
-      "❌ No target set.\n" +
-        "Use /set_target <user_id> to configure a recipient.",
+      "❌ No target set.\n" + "Use /set_target to configure a recipient.",
     );
   }
 
-  await ctx.reply(`📍 Current target: ${target}`);
+  try {
+    const targetInfo = await bot.telegram.getChat(target);
+    const username = (targetInfo as any).username
+      ? `@${(targetInfo as any).username}`
+      : "N/A";
+    const firstName = (targetInfo as any).first_name || "Unknown";
+    const isBot = (targetInfo as any).is_bot ? "🤖 Bot" : "👤 User";
+
+    let userDetails = `📍 <b>Current Target:</b>\n\n`;
+    userDetails += `<b>Name:</b> ${firstName}\n`;
+    userDetails += `<b>Username:</b> ${username}\n`;
+    userDetails += `<b>ID:</b> <code>${target}</code>\n`;
+    userDetails += `<b>Type:</b> ${isBot}`;
+
+    // Get user from DB for more info if available
+    if (mongoReady) {
+      try {
+        const dbUser = await UserModel.findOne({ userId: target }).lean();
+        if (dbUser?.createdAt) {
+          const createdDate = new Date(dbUser.createdAt).toLocaleDateString(
+            "es-ES",
+          );
+          userDetails += `\n<b>Member Since:</b> ${createdDate}`;
+        }
+      } catch (dbError) {
+        // Ignore DB errors
+      }
+    }
+
+    await ctx.reply(userDetails, { parse_mode: "HTML" });
+  } catch (error) {
+    // If we can't get the chat info, just show the ID
+    await ctx.reply(`📍 <b>Current target:</b> <code>${target}</code>`, {
+      parse_mode: "HTML",
+    });
+  }
 });
 
 // /change_target command
@@ -594,22 +750,81 @@ bot.command("change_target", async (ctx: Context) => {
   if (!userId) return;
 
   const message = ctx.message as any;
-  if (!message?.text) {
-    return ctx.reply("Error: message is undefined");
-  }
-
-  const parts = message.text.split(" ");
+  const parts = message?.text?.split(" ") || [];
   const targetId = Number(parts[1]);
 
-  if (!targetId || isNaN(targetId)) {
-    return ctx.reply(
-      "Please provide a valid target user ID.\n" +
-        "Usage: /change_target <user_id>",
-    );
+  // If user provided an ID, use it directly
+  if (targetId && !isNaN(targetId)) {
+    if (userId === targetId) {
+      return ctx.reply(
+        "❌ You can't set yourself as target!\n\n" +
+          "Please provide another user's ID.",
+      );
+    }
+
+    try {
+      const targetInfo = await bot.telegram.getChat(targetId);
+      const username = (targetInfo as any).username
+        ? `@${(targetInfo as any).username}`
+        : "N/A";
+      const firstName = (targetInfo as any).first_name || "Unknown";
+
+      await setTarget(userId, targetId);
+      await ctx.reply(
+        `✅ Target updated successfully!\n\n` +
+          `📍 Now forwarding to:\n` +
+          `• Name: ${firstName}\n` +
+          `• Username: ${username}\n` +
+          `• ID: ${targetId}`,
+      );
+    } catch (error) {
+      return ctx.reply(
+        "❌ Could not find user with that ID.\n\n" +
+          "Make sure the user ID is correct and the user has started the bot.",
+      );
+    }
+    return;
   }
 
-  await setTarget(userId, targetId);
-  await ctx.reply(`✅ Target updated to: ${targetId}`);
+  // If no ID provided, show list of users with buttons
+  try {
+    const users = await getAllRegisteredUsers();
+    const filtered = users.filter((u) => u.userId !== userId);
+
+    if (filtered.length === 0) {
+      return ctx.reply(
+        "❌ No other users available.\n\n" +
+          "Other users must start the bot first.",
+      );
+    }
+
+    const buttons: InlineKeyboardButton[][] = [];
+    for (let i = 0; i < filtered.length; i += 2) {
+      const row: InlineKeyboardButton[] = [];
+      for (let j = i; j < Math.min(i + 2, filtered.length); j++) {
+        const user = filtered[j];
+        const displayName =
+          user.firstName && user.firstName !== "Unknown"
+            ? user.firstName
+            : `User ${user.userId}`;
+        row.push({
+          text: displayName,
+          callback_data: `change_target_${user.userId}`,
+        });
+      }
+      buttons.push(row);
+    }
+
+    await ctx.reply("🔄 <b>Select a new user to forward media to:</b>", {
+      reply_markup: { inline_keyboard: buttons },
+      parse_mode: "HTML",
+    });
+  } catch (error) {
+    console.error("[ERROR] Failed to fetch users:", error);
+    return ctx.reply(
+      "❌ Error loading users. Try providing a user ID manually.",
+    );
+  }
 });
 
 // /stats command (Admin only)
@@ -918,6 +1133,52 @@ bot.on("audio", async (ctx: Context) => {
   }
 });
 
+// Handle callback queries for set_target and change_target buttons
+bot.action(/^(set|change)_target_(\d+)$/, async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const match = (ctx.match as RegExpExecArray) || [];
+  const action = match[1];
+  const targetId = Number(match[2]);
+
+  if (userId === targetId) {
+    return ctx.answerCbQuery("❌ You can't set yourself as target!", {
+      show_alert: true,
+    });
+  }
+
+  try {
+    const targetInfo = await bot.telegram.getChat(targetId);
+    const username = (targetInfo as any).username
+      ? `@${(targetInfo as any).username}`
+      : "N/A";
+    const firstName = (targetInfo as any).first_name || "Unknown";
+
+    await setTarget(userId, targetId);
+
+    const actionText = action === "set" ? "set" : "updated";
+    const message =
+      `✅ Target ${actionText} successfully!\n\n` +
+      `📍 Forwarding to:\n` +
+      `• Name: ${firstName}\n` +
+      `• Username: ${username}\n` +
+      `• ID: ${targetId}`;
+
+    // Edit the message to show the result
+    await ctx.editMessageText(message);
+    await ctx.answerCbQuery();
+  } catch (error) {
+    console.error(
+      `[ERROR] Failed to set target from button for user ${userId}:`,
+      error,
+    );
+    await ctx.answerCbQuery("❌ Could not set target. Try again later.", {
+      show_alert: true,
+    });
+  }
+});
+
 // Launch bot with dropPendingUpdates
 bot.launch({
   dropPendingUpdates: true,
@@ -943,6 +1204,7 @@ bot.telegram
     { command: "status", description: "Check bot status" },
     { command: "live", description: "Check if bot is awake" },
     { command: "mystats", description: "Show my profile" },
+    { command: "refresh_profile", description: "Update profile data" },
     { command: "stats", description: "Show user stats (Admin)" },
     { command: "reply", description: "<id> <message> - Send message" },
     { command: "power_on", description: "Turn bot ON (Admin only)" },
