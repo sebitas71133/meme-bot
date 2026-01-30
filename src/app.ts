@@ -196,16 +196,25 @@ async function upsertUserInfo(ctx: Context): Promise<void> {
   if (!mongoReady || !ctx.from) return;
 
   const { id, first_name, username } = ctx.from;
-  await UserModel.updateOne(
-    { userId: id },
-    {
-      $set: {
-        firstName: first_name,
-        username,
+  
+  // Check if user exists and if data has changed
+  const existingUser = await UserModel.findOne({ userId: id });
+  
+  // Only update if user doesn't exist or data has changed
+  if (!existingUser || 
+      existingUser.firstName !== first_name || 
+      existingUser.username !== username) {
+    await UserModel.updateOne(
+      { userId: id },
+      {
+        $set: {
+          firstName: first_name,
+          username,
+        },
       },
-    },
-    { upsert: true },
-  );
+      { upsert: true },
+    );
+  }
 }
 
 // Middleware: persist user info on every update
