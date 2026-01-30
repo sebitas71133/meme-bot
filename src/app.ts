@@ -1138,7 +1138,8 @@ bot.action(/^(set|change)_target_(\d+)$/, async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  const match = (ctx.match as RegExpExecArray) || [];
+  // Cast to any to access match property which is added by Telegraf
+  const match = (ctx as any).match as RegExpExecArray;
   const action = match[1];
   const targetId = Number(match[2]);
 
