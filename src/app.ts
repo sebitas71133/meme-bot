@@ -389,6 +389,42 @@ bot.command("live", async (ctx: Context) => {
   return ctx.reply("🟢 Bot is online and ready.");
 });
 
+// /mystats command (Show user's own profile)
+bot.command("mystats", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  if (!mongoReady) {
+    return ctx.reply(
+      "⚠️ MongoDB is not connected. Stats are unavailable right now.",
+    );
+  }
+
+  try {
+    const user = await UserModel.findOne({ userId }).lean();
+
+    if (!user) {
+      return ctx.reply(
+        "❌ Your profile not found. Please use /start to register.",
+      );
+    }
+
+    const adminBadge = user.isAdmin ? " 👑 (Admin)" : " (Regular User)";
+    const username = user.username ? `@${user.username}` : "Not set";
+
+    const message =
+      `👤 <b>Your Profile</b>\n\n` +
+      `<b>Username:</b> ${username}\n` +
+      `<b>User ID:</b> <code>${userId}</code>\n` +
+      `<b>Status:</b>${adminBadge}`;
+
+    return ctx.reply(message, { parse_mode: "HTML" });
+  } catch (error) {
+    console.error("[ERROR] Failed to fetch user stats:", error);
+    return ctx.reply("❌ Error fetching your profile.");
+  }
+});
+
 // /reply command
 bot.command("reply", async (ctx: Context) => {
   const senderId = ctx.from?.id;
@@ -465,7 +501,21 @@ bot.command("promote", async (ctx: Context) => {
       { $set: { isAdmin: true } },
       { upsert: true },
     );
-    return ctx.reply(`✅ User ${targetUserId} promoted to Admin`);
+    await ctx.reply(`✅ User ${targetUserId} promoted to Admin`);
+
+    // Notify the promoted user
+    try {
+      await bot.telegram.sendMessage(
+        targetUserId,
+        "👑 <b>Congratulations!</b>\n\nYou have been promoted to <b>Admin</b>!\n\nYou can now use:\n🔐 /power_on - Enable bot\n🔒 /power_off - Disable bot\n📊 /stats - View user statistics",
+        { parse_mode: "HTML" },
+      );
+    } catch (notifyError) {
+      console.log(
+        `[INFO] Could not notify user ${targetUserId}, they may not have started the bot`,
+      );
+    }
+    return;
   } catch (e: any) {
     console.error(`[ERROR] Failed to promote user ${targetUserId}:`, e);
     return ctx.reply(
@@ -479,16 +529,17 @@ bot.command("help", async (ctx: Context) => {
   await ctx.reply(
     "<b>📋 Available Commands:</b>\n\n" +
       "🚀 /start - Welcome message\n" +
-      "🎯 /set_target &lt;id&gt; - Set media recipient\n" +
+      "🎯 /set_target <id> - Set media recipient\n" +
       "📍 /get_target - Show current recipient\n" +
-      "🔄 /change_target &lt;id&gt; - Update recipient\n" +
+      "🔄 /change_target <id> - Update recipient\n" +
       "📡 /status - Check bot status\n" +
       "🟢 /live - Check if bot is awake\n" +
+      "👤 /mystats - Show my profile (username, ID, admin status)\n" +
       "📊 /stats - Show user stats (Admin only)\n" +
-      "✉️ /reply &lt;id&gt; &lt;message&gt; - Send message\n" +
+      "✉️ /reply <id> <message> - Send message\n" +
       "🔐 /power_on - Turn bot ON (Admin only)\n" +
       "🔒 /power_off - Turn bot OFF (Admin only)\n" +
-      "👑 /promote &lt;id&gt; - Promote user to admin (Super-admin only)\n" +
+      "👑 /promote <id> - Promote user to admin (Super-admin only)\n" +
       "❓ /help - Show this message",
     { parse_mode: "HTML" },
   );
