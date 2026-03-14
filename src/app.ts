@@ -43,6 +43,8 @@ let botReady = false;
 
 // In-memory rate limiting
 const userLastSent = new Map<number, number>();
+const pendingInviteUsers = new Set<number>();
+const invalidInviteWarnedUsers = new Set<number>();
 
 // Store media groups temporarily
 const mediaGroupBuffer = new Map<string, any[]>();
@@ -62,6 +64,22 @@ interface UserDoc {
   username?: string;
   targetId?: number;
   isAdmin?: boolean;
+  isVerified?: boolean;
+  isBanned?: boolean;
+  bannedAt?: Date;
+  banReason?: string;
+  inviteCodeUsed?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface InviteCodeDoc {
+  code: string;
+  isActive: boolean;
+  usesCount: number;
+  usedBy: number[];
+  createdBy?: number;
+  lastUsedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -73,11 +91,32 @@ const userSchema = new mongoose.Schema<UserDoc>(
     username: { type: String },
     targetId: { type: Number },
     isAdmin: { type: Boolean, default: false },
+    isVerified: { type: Boolean, default: false },
+    isBanned: { type: Boolean, default: false },
+    bannedAt: { type: Date },
+    banReason: { type: String },
+    inviteCodeUsed: { type: String },
+  },
+  { timestamps: true },
+);
+
+const inviteCodeSchema = new mongoose.Schema<InviteCodeDoc>(
+  {
+    code: { type: String, required: true, unique: true },
+    isActive: { type: Boolean, default: true },
+    usesCount: { type: Number, default: 0 },
+    usedBy: { type: [Number], default: [] },
+    createdBy: { type: Number },
+    lastUsedAt: { type: Date },
   },
   { timestamps: true },
 );
 
 const UserModel = mongoose.model<UserDoc>("User", userSchema);
+const InviteCodeModel = mongoose.model<InviteCodeDoc>(
+  "InviteCode",
+  inviteCodeSchema,
+);
 let mongoReady = false;
 
 async function connectMongo(): Promise<void> {
@@ -114,6 +153,103 @@ function saveData(data: UserData[]): void {
   } catch (e) {
     console.error("Failed to save data.json:", e);
   }
+}
+
+function normalizeInviteCode(code: string): string {
+  return code.trim().toUpperCase();
+}
+
+function buildWelcomeMessage(): string {
+  return (
+    "Welcome! 👋\n\n" +
+    "Use /set_target <user_id> to specify who receives your media.\n" +
+    "Use /get_target to see your current target.\n" +
+    "Use /change_target <user_id> to update it.\n" +
+    "Use /help for more info."
+  );
+}
+
+async function syncUserProfile(
+  ctx: Context,
+  options?: {
+    verify?: boolean;
+    inviteCodeUsed?: string;
+    forceAdmin?: boolean;
+    clearBan?: boolean;
+  },
+): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId || !mongoReady) return;
+
+  const { first_name, username } = ctx.from;
+  const update: Partial<UserDoc> = {
+    firstName: first_name,
+    username,
+  };
+
+  if (typeof options?.verify === "boolean") {
+    update.isVerified = options.verify;
+  }
+
+  if (options?.inviteCodeUsed) {
+    update.inviteCodeUsed = options.inviteCodeUsed;
+  }
+
+  if (options?.forceAdmin) {
+    update.isAdmin = true;
+  }
+
+  if (options?.clearBan) {
+    update.isBanned = false;
+    update.bannedAt = undefined;
+    update.banReason = undefined;
+  }
+
+  const mongoUpdate: {
+    $set: Partial<UserDoc>;
+    $unset?: Record<string, number>;
+  } = { $set: update };
+
+  if (options?.clearBan) {
+    mongoUpdate.$unset = {
+      bannedAt: 1,
+      banReason: 1,
+    };
+  }
+
+  await UserModel.updateOne({ userId }, mongoUpdate, { upsert: true });
+}
+
+async function removeUserFromData(userId: number): Promise<void> {
+  const data = loadData();
+  const filtered = data.filter(
+    (entry) => entry.userId !== userId && entry.targetId !== userId,
+  );
+
+  if (filtered.length !== data.length) {
+    saveData(filtered);
+  }
+}
+
+async function clearTargetsPointingToUser(userId: number): Promise<void> {
+  if (mongoReady) {
+    await UserModel.updateMany(
+      { targetId: userId },
+      { $unset: { targetId: 1 } },
+    );
+    return;
+  }
+
+  await removeUserFromData(userId);
+}
+
+async function isBannedUser(userId: number): Promise<boolean> {
+  if (mongoReady) {
+    const user = await UserModel.findOne({ userId }).lean();
+    return user?.isBanned ?? false;
+  }
+
+  return false;
 }
 
 async function findTarget(userId: number): Promise<number | null> {
@@ -172,14 +308,25 @@ async function getAllUsers(): Promise<number[]> {
   return Array.from(userIds);
 }
 
-async function isRegisteredUser(userId: number): Promise<boolean> {
+async function isAuthorizedUser(userId: number): Promise<boolean> {
+  if (userId === ADMIN_ID) return true;
+
   if (mongoReady) {
     const user = await UserModel.findOne({ userId }).lean();
-    return !!user;
+    if (!user) return false;
+
+    if (user.isBanned) return false;
+
+    return !!(
+      user.isAdmin ||
+      user.isVerified ||
+      user.firstName ||
+      user.username
+    );
   }
 
   const data = loadData();
-  return data.some((u) => u.userId === userId || u.targetId === userId);
+  return data.some((u) => u.userId === userId);
 }
 
 async function isAdmin(userId: number): Promise<boolean> {
@@ -193,12 +340,39 @@ async function isAdmin(userId: number): Promise<boolean> {
   return false;
 }
 
+async function ensureAuthorizedUser(
+  ctx: Context,
+  userId?: number,
+): Promise<boolean> {
+  if (!userId) {
+    await ctx.reply("❌ User ID not found.");
+    return false;
+  }
+
+  if (await isBannedUser(userId)) {
+    await ctx.reply("⛔ Access denied. Your account was banned from this bot.");
+    return false;
+  }
+
+  const authorized = await isAuthorizedUser(userId);
+  if (authorized) return true;
+
+  await ctx.reply(
+    "🔐 Access restricted.\n\n" +
+      "Use /start and send a valid invitation code to activate your access.",
+  );
+  return false;
+}
+
 // Get all registered users with their info
 async function getAllRegisteredUsers(): Promise<
   Array<{ userId: number; firstName?: string; username?: string }>
 > {
   if (mongoReady) {
-    const users = await UserModel.find().lean();
+    const users = await UserModel.find({
+      $or: [{ isVerified: true }, { isAdmin: true }],
+      isBanned: { $ne: true },
+    }).lean();
     return users.map((u) => ({
       userId: u.userId,
       firstName: u.firstName,
@@ -322,40 +496,139 @@ async function sendMediaGroup(
 // /start command
 bot.command("start", async (ctx: Context) => {
   const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
 
-  // Save user info to database on first interaction
-  if (userId && mongoReady) {
+  if (userId === ADMIN_ID) {
     try {
-      const { first_name, username } = ctx.from;
-      await UserModel.updateOne(
-        { userId },
-        {
-          $set: {
-            firstName: first_name,
-            username,
-          },
-        },
-        { upsert: true },
-      );
+      await syncUserProfile(ctx, {
+        verify: true,
+        forceAdmin: true,
+        clearBan: true,
+      });
+      pendingInviteUsers.delete(userId);
+      invalidInviteWarnedUsers.delete(userId);
+      console.log(`[USER] Admin access refreshed for ${userId}`);
+    } catch (e) {
+      console.error(`[ERROR] Failed to save admin user ${userId}:`, e);
+    }
+
+    return ctx.reply(buildWelcomeMessage());
+  }
+
+  if (await isBannedUser(userId)) {
+    pendingInviteUsers.delete(userId);
+    invalidInviteWarnedUsers.delete(userId);
+    return ctx.reply(
+      "⛔ Your access to this bot was revoked by an administrator.",
+    );
+  }
+
+  const authorized = await isAuthorizedUser(userId);
+  if (authorized) {
+    try {
+      await syncUserProfile(ctx);
+      pendingInviteUsers.delete(userId);
+      invalidInviteWarnedUsers.delete(userId);
       console.log(`[USER] Registered/updated user ${userId}`);
     } catch (e) {
       console.error(`[ERROR] Failed to save user ${userId}:`, e);
     }
+
+    return ctx.reply(buildWelcomeMessage());
   }
 
-  await ctx.reply(
-    "Welcome! 👋\n\n" +
-      "Use /set_target <user_id> to specify who receives your media.\n" +
-      "Use /get_target to see your current target.\n" +
-      "Use /change_target <user_id> to update it.\n" +
-      "Use /help for more info.",
+  if (!mongoReady) {
+    return ctx.reply(
+      "⚠️ Registration is temporarily unavailable because MongoDB is not connected. Try again later.",
+    );
+  }
+
+  pendingInviteUsers.add(userId);
+  invalidInviteWarnedUsers.delete(userId);
+  return ctx.reply(
+    "🔐 This bot requires an invitation code.\n\n" +
+      "Send your code in the next message to complete registration.",
   );
+});
+
+bot.on("text", async (ctx: Context, next) => {
+  const userId = ctx.from?.id;
+  if (!userId || !pendingInviteUsers.has(userId)) return next();
+
+  const message = ctx.message as any;
+  const text = message?.text?.trim();
+
+  if (!text || text.startsWith("/")) {
+    return next();
+  }
+
+  if (!mongoReady) {
+    pendingInviteUsers.delete(userId);
+    invalidInviteWarnedUsers.delete(userId);
+    return ctx.reply(
+      "⚠️ MongoDB is not connected right now. I cannot validate invitation codes.",
+    );
+  }
+
+  const inviteCode = normalizeInviteCode(text);
+
+  try {
+    const invite = await InviteCodeModel.findOne({
+      code: inviteCode,
+      isActive: true,
+    }).lean();
+
+    if (!invite) {
+      if (invalidInviteWarnedUsers.has(userId)) {
+        return;
+      }
+
+      invalidInviteWarnedUsers.add(userId);
+      return ctx.reply(
+        "❌ Invalid invitation code.\n\n" +
+          "Try again or contact the administrator.",
+      );
+    }
+
+    await syncUserProfile(ctx, { verify: true, inviteCodeUsed: inviteCode });
+    await InviteCodeModel.updateOne(
+      { _id: invite._id },
+      {
+        $set: { lastUsedAt: new Date() },
+        $inc: { usesCount: 1 },
+        $addToSet: { usedBy: userId },
+      },
+    );
+
+    pendingInviteUsers.delete(userId);
+    invalidInviteWarnedUsers.delete(userId);
+    console.log(
+      `[INVITE] User ${userId} verified with invite code ${inviteCode}`,
+    );
+
+    return ctx.reply(
+      "✅ Invitation code accepted. Your access is now active.\n\n" +
+        buildWelcomeMessage(),
+    );
+  } catch (error) {
+    console.error(
+      `[ERROR] Failed to validate invite code for ${userId}:`,
+      error,
+    );
+    return ctx.reply(
+      "❌ Failed to validate the invitation code. Try again later.",
+    );
+  }
 });
 
 // /refresh_profile command
 bot.command("refresh_profile", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return ctx.reply("❌ User ID not found.");
+
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
 
   if (!mongoReady) {
     return ctx.reply(
@@ -364,17 +637,9 @@ bot.command("refresh_profile", async (ctx: Context) => {
   }
 
   try {
+    await syncUserProfile(ctx);
+
     const { first_name, username } = ctx.from;
-    await UserModel.updateOne(
-      { userId },
-      {
-        $set: {
-          firstName: first_name,
-          username,
-        },
-      },
-      { upsert: true },
-    );
 
     const displayName = first_name || "Unknown";
     const displayUsername = username ? `@${username}` : "Not set";
@@ -458,6 +723,10 @@ bot.command("mystats", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return ctx.reply("❌ User ID not found.");
 
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
+
   if (!mongoReady) {
     return ctx.reply(
       "⚠️ MongoDB is not connected. Stats are unavailable right now.",
@@ -495,11 +764,11 @@ bot.command("reply", async (ctx: Context) => {
   const senderName = ctx.from?.first_name || "Unknown";
   if (!senderId) return;
 
-  const registered = await isRegisteredUser(senderId);
+  const registered = await isAuthorizedUser(senderId);
   if (!registered) {
     return ctx.reply(
-      "❌ You must be registered to use /reply.\n" +
-        "Use /start first and set a target with /set_target.",
+      "❌ You must activate your access before using /reply.\n" +
+        "Use /start and enter a valid invitation code.",
     );
   }
 
@@ -592,7 +861,7 @@ bot.command("promote", async (ctx: Context) => {
 bot.command("help", async (ctx: Context) => {
   await ctx.reply(
     "<b>📋 Available Commands:</b>\n\n" +
-      "🚀 /start - Welcome message\n" +
+      "🚀 /start - Start registration or open the bot\n" +
       "🎯 /set_target &lt;id&gt; - Set media recipient\n" +
       "📍 /get_target - Show current recipient\n" +
       "🔄 /change_target &lt;id&gt; - Update recipient\n" +
@@ -605,15 +874,381 @@ bot.command("help", async (ctx: Context) => {
       "🔐 /power_on - Turn bot ON (Admin only)\n" +
       "🔒 /power_off - Turn bot OFF (Admin only)\n" +
       "👑 /promote &lt;id&gt; - Promote user to admin (Super-admin only)\n" +
+      "🧩 /create_invite &lt;code&gt; - Create or reactivate an invite code (Admin only)\n" +
+      "🚫 /disable_invite &lt;code&gt; - Disable an invite code (Admin only)\n" +
+      "📨 /list_invites - Show invite codes (Admin only)\n" +
+      "🥾 /kick_user &lt;id&gt; - Remove a user access (Admin only)\n" +
+      "⛔ /ban_user &lt;id&gt; [reason] - Ban a user from the bot (Admin only)\n" +
+      "✅ /unban_user &lt;id&gt; - Restore a banned user (Admin only)\n" +
       "❓ /help - Show this message",
     { parse_mode: "HTML" },
   );
+});
+
+bot.command("create_invite", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+  if (!authorized) {
+    return ctx.reply("❌ Unauthorized. Admin only.");
+  }
+
+  if (!mongoReady) {
+    return ctx.reply(
+      "⚠️ MongoDB is not connected. Cannot manage invitation codes.",
+    );
+  }
+
+  const message = ctx.message as any;
+  const parts = message?.text?.split(" ") || [];
+  const rawCode = parts.slice(1).join(" ").trim();
+
+  if (!rawCode) {
+    return ctx.reply(
+      "Usage: /create_invite <code>\n" +
+        "Example: /create_invite MY-ACCESS-2026",
+    );
+  }
+
+  const code = normalizeInviteCode(rawCode);
+
+  try {
+    await InviteCodeModel.updateOne(
+      { code },
+      {
+        $set: {
+          code,
+          isActive: true,
+          createdBy: userId,
+        },
+      },
+      { upsert: true },
+    );
+
+    return ctx.reply(
+      `✅ Invitation code saved successfully.\n\n` +
+        `Code: ${code}\n` +
+        `Status: active`,
+    );
+  } catch (error: any) {
+    console.error(`[ERROR] Failed to create invite code ${code}:`, error);
+    return ctx.reply(
+      "❌ Failed to save the invitation code. Error: " +
+        (error?.message || "Unknown error"),
+    );
+  }
+});
+
+bot.command("list_invites", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+  if (!authorized) {
+    return ctx.reply("❌ Unauthorized. Admin only.");
+  }
+
+  if (!mongoReady) {
+    return ctx.reply(
+      "⚠️ MongoDB is not connected. Cannot list invitation codes.",
+    );
+  }
+
+  try {
+    const invites = await InviteCodeModel.find().sort({ updatedAt: -1 }).lean();
+
+    if (!invites.length) {
+      return ctx.reply("ℹ️ No invitation codes found.");
+    }
+
+    const lines = invites.map((invite, index) => {
+      const status = invite.isActive ? "active" : "inactive";
+      const lastUsed = invite.lastUsedAt
+        ? new Date(invite.lastUsedAt).toLocaleString("es-ES")
+        : "never";
+      return (
+        `${index + 1}. ${invite.code}\n` +
+        `   Status: ${status}\n` +
+        `   Uses: ${invite.usesCount}\n` +
+        `   Last use: ${lastUsed}`
+      );
+    });
+
+    return ctx.reply(`📨 Invitation Codes\n\n${lines.join("\n\n")}`);
+  } catch (error) {
+    console.error("[ERROR] Failed to list invitation codes:", error);
+    return ctx.reply("❌ Failed to fetch invitation codes.");
+  }
+});
+
+bot.command("disable_invite", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+  if (!authorized) {
+    return ctx.reply("❌ Unauthorized. Admin only.");
+  }
+
+  if (!mongoReady) {
+    return ctx.reply(
+      "⚠️ MongoDB is not connected. Cannot manage invitation codes.",
+    );
+  }
+
+  const message = ctx.message as any;
+  const parts = message?.text?.split(" ") || [];
+  const rawCode = parts.slice(1).join(" ").trim();
+
+  if (!rawCode) {
+    return ctx.reply(
+      "Usage: /disable_invite <code>\n" +
+        "Example: /disable_invite MY-ACCESS-2026",
+    );
+  }
+
+  const code = normalizeInviteCode(rawCode);
+
+  try {
+    const result = await InviteCodeModel.updateOne(
+      { code },
+      { $set: { isActive: false } },
+    );
+
+    if (!result.matchedCount) {
+      return ctx.reply("❌ Invitation code not found.");
+    }
+
+    return ctx.reply(
+      `🚫 Invitation code disabled successfully.\n\n` +
+        `Code: ${code}\n` +
+        `Status: inactive`,
+    );
+  } catch (error: any) {
+    console.error(`[ERROR] Failed to disable invite code ${code}:`, error);
+    return ctx.reply(
+      "❌ Failed to disable the invitation code. Error: " +
+        (error?.message || "Unknown error"),
+    );
+  }
+});
+
+bot.command("kick_user", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+  if (!authorized) {
+    return ctx.reply("❌ Unauthorized. Admin only.");
+  }
+
+  const message = ctx.message as any;
+  const parts = message?.text?.split(" ") || [];
+  const targetUserId = Number(parts[1]);
+
+  if (!targetUserId || Number.isNaN(targetUserId)) {
+    return ctx.reply(
+      "Usage: /kick_user <tg_id>\n" + "Example: /kick_user 123456789",
+    );
+  }
+
+  if (targetUserId === ADMIN_ID || targetUserId === userId) {
+    return ctx.reply("❌ You cannot kick this user.");
+  }
+
+  if (mongoReady) {
+    const targetUser = await UserModel.findOne({ userId: targetUserId }).lean();
+    if (targetUser?.isAdmin && userId !== ADMIN_ID) {
+      return ctx.reply("❌ Only the super admin can kick another admin.");
+    }
+  }
+
+  try {
+    pendingInviteUsers.delete(targetUserId);
+    userLastSent.delete(targetUserId);
+    await clearTargetsPointingToUser(targetUserId);
+
+    if (mongoReady) {
+      await UserModel.deleteOne({ userId: targetUserId });
+    } else {
+      await removeUserFromData(targetUserId);
+    }
+
+    try {
+      await bot.telegram.sendMessage(
+        targetUserId,
+        "🚫 Fuiste expulsado del bot por un administrador.\n\nSi corresponde, deberás solicitar acceso nuevamente.",
+      );
+    } catch (notifyError) {
+      console.log(
+        `[INFO] Could not notify kicked user ${targetUserId}:`,
+        notifyError,
+      );
+    }
+
+    return ctx.reply(`✅ User ${targetUserId} was kicked successfully.`);
+  } catch (error: any) {
+    console.error(`[ERROR] Failed to kick user ${targetUserId}:`, error);
+    return ctx.reply(
+      "❌ Failed to kick the user. Error: " +
+        (error?.message || "Unknown error"),
+    );
+  }
+});
+
+bot.command("ban_user", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+  if (!authorized) {
+    return ctx.reply("❌ Unauthorized. Admin only.");
+  }
+
+  if (!mongoReady) {
+    return ctx.reply("⚠️ MongoDB is not connected. Cannot ban users.");
+  }
+
+  const message = ctx.message as any;
+  const parts = message?.text?.split(" ") || [];
+  const targetUserId = Number(parts[1]);
+  const reason = parts.slice(2).join(" ").trim();
+
+  if (!targetUserId || Number.isNaN(targetUserId)) {
+    return ctx.reply(
+      "Usage: /ban_user <tg_id> [reason]\n" +
+        "Example: /ban_user 123456789 spam",
+    );
+  }
+
+  if (targetUserId === ADMIN_ID || targetUserId === userId) {
+    return ctx.reply("❌ You cannot ban this user.");
+  }
+
+  const targetUser = await UserModel.findOne({ userId: targetUserId }).lean();
+  if (targetUser?.isAdmin && userId !== ADMIN_ID) {
+    return ctx.reply("❌ Only the super admin can ban another admin.");
+  }
+
+  try {
+    pendingInviteUsers.delete(targetUserId);
+    userLastSent.delete(targetUserId);
+    await clearTargetsPointingToUser(targetUserId);
+
+    await UserModel.updateOne(
+      { userId: targetUserId },
+      {
+        $set: {
+          isBanned: true,
+          isVerified: false,
+          bannedAt: new Date(),
+          banReason: reason || "No reason specified",
+        },
+        $unset: {
+          targetId: 1,
+        },
+      },
+      { upsert: true },
+    );
+
+    try {
+      await bot.telegram.sendMessage(
+        targetUserId,
+        "⛔ Fuiste baneado del bot por un administrador." +
+          (reason ? `\n\nMotivo: ${reason}` : ""),
+      );
+    } catch (notifyError) {
+      console.log(
+        `[INFO] Could not notify banned user ${targetUserId}:`,
+        notifyError,
+      );
+    }
+
+    return ctx.reply(
+      `✅ User ${targetUserId} was banned successfully.` +
+        (reason ? `\nReason: ${reason}` : ""),
+    );
+  } catch (error: any) {
+    console.error(`[ERROR] Failed to ban user ${targetUserId}:`, error);
+    return ctx.reply(
+      "❌ Failed to ban the user. Error: " +
+        (error?.message || "Unknown error"),
+    );
+  }
+});
+
+bot.command("unban_user", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+  if (!authorized) {
+    return ctx.reply("❌ Unauthorized. Admin only.");
+  }
+
+  if (!mongoReady) {
+    return ctx.reply("⚠️ MongoDB is not connected. Cannot unban users.");
+  }
+
+  const message = ctx.message as any;
+  const parts = message?.text?.split(" ") || [];
+  const targetUserId = Number(parts[1]);
+
+  if (!targetUserId || Number.isNaN(targetUserId)) {
+    return ctx.reply(
+      "Usage: /unban_user <tg_id>\n" + "Example: /unban_user 123456789",
+    );
+  }
+
+  try {
+    const result = await UserModel.updateOne(
+      { userId: targetUserId },
+      {
+        $set: {
+          isBanned: false,
+        },
+        $unset: {
+          bannedAt: 1,
+          banReason: 1,
+        },
+      },
+    );
+
+    if (!result.matchedCount) {
+      return ctx.reply("❌ User not found in database.");
+    }
+
+    try {
+      await bot.telegram.sendMessage(
+        targetUserId,
+        "✅ Tu ban fue removido. Si necesitas acceso otra vez, usa /start e ingresa un código de invitación válido.",
+      );
+    } catch (notifyError) {
+      console.log(
+        `[INFO] Could not notify unbanned user ${targetUserId}:`,
+        notifyError,
+      );
+    }
+
+    return ctx.reply(`✅ User ${targetUserId} was unbanned successfully.`);
+  } catch (error: any) {
+    console.error(`[ERROR] Failed to unban user ${targetUserId}:`, error);
+    return ctx.reply(
+      "❌ Failed to unban the user. Error: " +
+        (error?.message || "Unknown error"),
+    );
+  }
 });
 
 // /set_target command
 bot.command("set_target", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
 
   const message = ctx.message as any;
   const parts = message?.text?.split(" ") || [];
@@ -699,6 +1334,10 @@ bot.command("get_target", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
+
   const target = await findTarget(userId);
   if (!target) {
     return ctx.reply(
@@ -748,6 +1387,10 @@ bot.command("get_target", async (ctx: Context) => {
 bot.command("change_target", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
 
   const message = ctx.message as any;
   const parts = message?.text?.split(" ") || [];
@@ -866,6 +1509,10 @@ bot.on("photo", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
+
   // Check if bot is enabled
   if (!botEnabled) {
     return ctx.reply(
@@ -947,6 +1594,10 @@ bot.on("photo", async (ctx: Context) => {
 bot.on("video", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
 
   // Check if bot is enabled
   if (!botEnabled) {
@@ -1030,6 +1681,10 @@ bot.on("document", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
+
   // Check if bot is enabled
   if (!botEnabled) {
     return ctx.reply(
@@ -1084,6 +1739,10 @@ bot.on("audio", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
+
   // Check if bot is enabled
   if (!botEnabled) {
     return ctx.reply(
@@ -1137,6 +1796,17 @@ bot.on("audio", async (ctx: Context) => {
 bot.action(/^(set|change)_target_(\d+)$/, async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  const authorized = await isAuthorizedUser(userId);
+  if (!authorized) {
+    await ctx.answerCbQuery(
+      "🔐 Access restricted. Use /start and validate your invite code.",
+      {
+        show_alert: true,
+      },
+    );
+    return;
+  }
 
   // Cast to any to access match property which is added by Telegraf
   const match = (ctx as any).match as RegExpExecArray;
@@ -1198,7 +1868,7 @@ process.on("unhandledRejection", (reason: any) => {
 // Register commands before starting
 bot.telegram
   .setMyCommands([
-    { command: "start", description: "Welcome message" },
+    { command: "start", description: "Start registration / open bot" },
     { command: "set_target", description: "<id> - Set media recipient" },
     { command: "get_target", description: "Show current recipient" },
     { command: "change_target", description: "<id> - Update recipient" },
@@ -1210,6 +1880,12 @@ bot.telegram
     { command: "reply", description: "<id> <message> - Send message" },
     { command: "power_on", description: "Turn bot ON (Admin only)" },
     { command: "power_off", description: "Turn bot OFF (Admin only)" },
+    { command: "create_invite", description: "<code> - Create invite code" },
+    { command: "disable_invite", description: "<code> - Disable invite code" },
+    { command: "list_invites", description: "Show invite codes" },
+    { command: "kick_user", description: "<id> - Kick user access" },
+    { command: "ban_user", description: "<id> - Ban user from bot" },
+    { command: "unban_user", description: "<id> - Restore banned user" },
     {
       command: "promote",
       description: "<id> - Promote user to admin (Super-admin)",
