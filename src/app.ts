@@ -12,6 +12,14 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const SEND_DELAY_MS = parseInt(process.env.SEND_DELAY_MS || "3000", 10);
 const ADMIN_ID = parseInt(process.env.ADMIN_ID || "0", 10);
 const PORT = parseInt(process.env.PORT || "3000", 10);
+const UNAUTHORIZED_MEDIA_BAN_THRESHOLD = parseInt(
+  process.env.UNAUTHORIZED_MEDIA_BAN_THRESHOLD || "8",
+  10,
+);
+const UNAUTHORIZED_MEDIA_WINDOW_MS = parseInt(
+  process.env.UNAUTHORIZED_MEDIA_WINDOW_MS || "600000",
+  10,
+);
 const MONGO_URI = process.env.MONGO_URI;
 const DATA_FILE = path.join(process.cwd(), "data.json");
 const DEFAULT_DATA: UserData[] = [
@@ -45,6 +53,10 @@ let botReady = false;
 const userLastSent = new Map<number, number>();
 const pendingInviteUsers = new Set<number>();
 const invalidInviteWarnedUsers = new Set<number>();
+const unauthorizedMediaAttempts = new Map<
+  number,
+  { count: number; firstAttemptAt: number }
+>();
 
 // Store media groups temporarily
 const mediaGroupBuffer = new Map<string, any[]>();
@@ -84,6 +96,16 @@ interface InviteCodeDoc {
   updatedAt: Date;
 }
 
+interface ForwardLogDoc {
+  sourceUserId: number;
+  targetUserId: number;
+  targetChatId: number;
+  targetMessageId: number;
+  messageType: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 const userSchema = new mongoose.Schema<UserDoc>(
   {
     userId: { type: Number, required: true, unique: true },
@@ -112,10 +134,30 @@ const inviteCodeSchema = new mongoose.Schema<InviteCodeDoc>(
   { timestamps: true },
 );
 
+const forwardLogSchema = new mongoose.Schema<ForwardLogDoc>(
+  {
+    sourceUserId: { type: Number, required: true },
+    targetUserId: { type: Number, required: true },
+    targetChatId: { type: Number, required: true },
+    targetMessageId: { type: Number, required: true },
+    messageType: { type: String, required: true },
+  },
+  { timestamps: true },
+);
+
+forwardLogSchema.index(
+  { targetChatId: 1, targetMessageId: 1 },
+  { unique: true },
+);
+
 const UserModel = mongoose.model<UserDoc>("User", userSchema);
 const InviteCodeModel = mongoose.model<InviteCodeDoc>(
   "InviteCode",
   inviteCodeSchema,
+);
+const ForwardLogModel = mongoose.model<ForwardLogDoc>(
+  "ForwardLog",
+  forwardLogSchema,
 );
 let mongoReady = false;
 
@@ -422,6 +464,77 @@ async function applyDelay(userId: number): Promise<void> {
   userLastSent.set(userId, Date.now());
 }
 
+async function handleUnauthorizedMediaAttempt(
+  ctx: Context,
+  userId: number,
+  mediaType: string,
+): Promise<boolean> {
+  if (userId === ADMIN_ID) return false;
+
+  const authorized = await isAuthorizedUser(userId);
+  if (authorized) {
+    unauthorizedMediaAttempts.delete(userId);
+    return false;
+  }
+
+  const now = Date.now();
+  const current = unauthorizedMediaAttempts.get(userId);
+
+  if (!current || now - current.firstAttemptAt > UNAUTHORIZED_MEDIA_WINDOW_MS) {
+    unauthorizedMediaAttempts.set(userId, { count: 1, firstAttemptAt: now });
+  } else {
+    unauthorizedMediaAttempts.set(userId, {
+      count: current.count + 1,
+      firstAttemptAt: current.firstAttemptAt,
+    });
+  }
+
+  const attempts = unauthorizedMediaAttempts.get(userId)?.count || 1;
+  console.warn(
+    `[SECURITY] Unauthorized media attempt (${mediaType}) from ${userId}. Count=${attempts}`,
+  );
+
+  if (
+    mongoReady &&
+    attempts >= UNAUTHORIZED_MEDIA_BAN_THRESHOLD &&
+    !(await isBannedUser(userId))
+  ) {
+    try {
+      await UserModel.updateOne(
+        { userId },
+        {
+          $set: {
+            firstName: ctx.from?.first_name,
+            username: ctx.from?.username,
+            isBanned: true,
+            isVerified: false,
+            bannedAt: new Date(),
+            banReason: "Auto-banned: repeated unauthorized media spam",
+          },
+          $unset: {
+            targetId: 1,
+          },
+        },
+        { upsert: true },
+      );
+
+      pendingInviteUsers.delete(userId);
+      invalidInviteWarnedUsers.delete(userId);
+      userLastSent.delete(userId);
+      unauthorizedMediaAttempts.delete(userId);
+
+      console.warn(
+        `[SECURITY] User ${userId} auto-banned for unauthorized media spam`,
+      );
+    } catch (error) {
+      console.error(`[ERROR] Failed to auto-ban user ${userId}:`, error);
+    }
+  }
+
+  // Silence by design for unauthorized media.
+  return true;
+}
+
 // Send media group as album
 async function sendMediaGroup(
   ctx: Context,
@@ -461,7 +574,10 @@ async function sendMediaGroup(
       await applyDelay(userId);
       console.log(`[DELAY END] Ready to send album`);
 
-      await ctx.telegram.sendMediaGroup(target, mediaItems);
+      const sentGroup = await ctx.telegram.sendMediaGroup(target, mediaItems);
+      for (const sentMessage of sentGroup) {
+        await saveForwardLog(userId, target, sentMessage, "media_group");
+      }
       console.log(
         `[MEDIA GROUP] Forwarded ${mediaItems.length} items from ${userId} to ${target}`,
       );
@@ -491,6 +607,37 @@ async function sendMediaGroup(
   // Clean up
   mediaGroupBuffer.delete(groupId);
   groupTimeouts.delete(groupId);
+}
+
+async function saveForwardLog(
+  sourceUserId: number,
+  targetUserId: number,
+  sentMessage: any,
+  messageType: string,
+): Promise<void> {
+  if (!mongoReady) return;
+
+  const chatId = sentMessage?.chat?.id;
+  const messageId = sentMessage?.message_id;
+  if (!chatId || !messageId) return;
+
+  try {
+    await ForwardLogModel.updateOne(
+      { targetChatId: chatId, targetMessageId: messageId },
+      {
+        $set: {
+          sourceUserId,
+          targetUserId,
+          targetChatId: chatId,
+          targetMessageId: messageId,
+          messageType,
+        },
+      },
+      { upsert: true },
+    );
+  } catch (e) {
+    console.error("[ERROR] Failed to save forward log:", e);
+  }
 }
 
 // /start command
@@ -790,9 +937,10 @@ bot.command("reply", async (ctx: Context) => {
 
   try {
     const fullMessage = `💬 <b>From ${senderName}:</b>\n\n${text}`;
-    await ctx.telegram.sendMessage(targetId, fullMessage, {
+    const sent = await ctx.telegram.sendMessage(targetId, fullMessage, {
       parse_mode: "HTML",
     });
+    await saveForwardLog(senderId, targetId, sent, "reply");
     return ctx.reply(`✅ Message sent to ${targetId}`);
   } catch (e: any) {
     console.error(`[ERROR] Failed to send message to ${targetId}:`, e);
@@ -868,6 +1016,7 @@ bot.command("help", async (ctx: Context) => {
       "📡 /status - Check bot status\n" +
       "🟢 /live - Check if bot is awake\n" +
       "👤 /mystats - Show my profile (username, ID, admin status)\n" +
+      "🕵️ /user_info (reply) - Show who sent that forwarded message\n" +
       "� /refresh_profile - Update profile data (name, username)\n" +
       "�📊 /stats - Show user stats (Admin only)\n" +
       "✉️ /reply &lt;id&gt; &lt;message&gt; - Send message\n" +
@@ -883,6 +1032,70 @@ bot.command("help", async (ctx: Context) => {
       "❓ /help - Show this message",
     { parse_mode: "HTML" },
   );
+});
+
+bot.command("user_info", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
+
+  if (!mongoReady) {
+    return ctx.reply(
+      "⚠️ MongoDB is not connected. Cannot resolve forwarded message info.",
+    );
+  }
+
+  const message = ctx.message as any;
+  const replied = message?.reply_to_message;
+
+  if (!replied?.message_id) {
+    return ctx.reply(
+      "Usage: reply to a forwarded message with /user_info\n\n" +
+        "Example:\n1) Reply to the message\n2) Send /user_info",
+    );
+  }
+
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    return ctx.reply("❌ Chat ID not found.");
+  }
+
+  try {
+    const log = await ForwardLogModel.findOne({
+      targetChatId: chatId,
+      targetMessageId: replied.message_id,
+    }).lean();
+
+    if (!log) {
+      return ctx.reply(
+        "ℹ️ I don't have sender info for that message.\n" +
+          "It may be older than this feature or not sent by this bot.",
+      );
+    }
+
+    const sourceUser = await UserModel.findOne({
+      userId: log.sourceUserId,
+    }).lean();
+    const username = sourceUser?.username
+      ? `@${sourceUser.username}`
+      : "Not available";
+    const firstName = sourceUser?.firstName || "Unknown";
+
+    return ctx.reply(
+      "🕵️ <b>Sender Info</b>\n\n" +
+        `<b>Name:</b> ${firstName}\n` +
+        `<b>Username:</b> ${username}\n` +
+        `<b>User ID:</b> <code>${log.sourceUserId}</code>\n` +
+        `<b>Message Type:</b> ${log.messageType}`,
+      { parse_mode: "HTML" },
+    );
+  } catch (error) {
+    console.error("[ERROR] Failed to get user_info:", error);
+    return ctx.reply("❌ Failed to fetch sender info.");
+  }
 });
 
 bot.command("create_invite", async (ctx: Context) => {
@@ -1504,12 +1717,77 @@ bot.command("stats", async (ctx: Context) => {
   return ctx.reply(message);
 });
 
+// Text handler (non-command): forward plain messages to target
+bot.on("text", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  const senderName = ctx.from?.first_name || "Unknown";
+  if (!userId) return;
+
+  if (pendingInviteUsers.has(userId)) {
+    return;
+  }
+
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
+
+  if (!botEnabled) {
+    return ctx.reply(
+      "🔴 Bot is currently OFFLINE. Message forwarding is suspended.",
+    );
+  }
+
+  const message = ctx.message as any;
+  if (!message?.text) {
+    return;
+  }
+
+  const text = message.text.trim();
+  if (!text || text.startsWith("/")) {
+    return;
+  }
+
+  const target = await findTarget(userId);
+  if (!target) {
+    return ctx.reply(
+      "❌ No target configured.\n" + "Use /set_target <user_id> first.",
+    );
+  }
+
+  try {
+    await applyDelay(userId);
+    const formattedText = `${text}\n\nfrom \"${senderName}\"`;
+    await ctx.telegram.sendMessage(target, formattedText);
+    console.log(`[TEXT] Forwarded from ${userId} to ${target}`);
+  } catch (e: any) {
+    console.error(
+      `[ERROR] Failed to forward text from ${userId} to ${target}:`,
+      e?.description || e?.message,
+    );
+
+    if (e?.description?.includes("chat not found")) {
+      await ctx.reply(
+        "❌ Cannot send to target user.\n\n" +
+          "The recipient must start the bot first:\n" +
+          "1. They need to search for this bot\n" +
+          "2. Click /start\n" +
+          "3. Then you can send messages to them",
+      );
+    } else {
+      await ctx.reply(
+        "❌ Failed to forward text. Error: " +
+          (e?.description || "Unknown error"),
+      );
+    }
+  }
+});
+
 // Photo handler
 bot.on("photo", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  if (!(await ensureAuthorizedUser(ctx, userId))) {
+  if (await handleUnauthorizedMediaAttempt(ctx, userId, "photo")) {
     return;
   }
 
@@ -1563,9 +1841,10 @@ bot.on("photo", async (ctx: Context) => {
   try {
     await applyDelay(userId);
     const photo = message.photo[message.photo.length - 1];
-    await ctx.telegram.sendPhoto(target, photo.file_id, {
+    const sent = await ctx.telegram.sendPhoto(target, photo.file_id, {
       caption: message.caption || undefined,
     });
+    await saveForwardLog(userId, target, sent, "photo");
     console.log(`[PHOTO] Forwarded from ${userId} to ${target}`);
   } catch (e: any) {
     console.error(
@@ -1595,7 +1874,7 @@ bot.on("video", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  if (!(await ensureAuthorizedUser(ctx, userId))) {
+  if (await handleUnauthorizedMediaAttempt(ctx, userId, "video")) {
     return;
   }
 
@@ -1649,9 +1928,10 @@ bot.on("video", async (ctx: Context) => {
   try {
     await applyDelay(userId);
     const video = message.video;
-    await ctx.telegram.sendVideo(target, video.file_id, {
+    const sent = await ctx.telegram.sendVideo(target, video.file_id, {
       caption: message.caption || undefined,
     });
+    await saveForwardLog(userId, target, sent, "video");
     console.log(`[VIDEO] Forwarded from ${userId} to ${target}`);
   } catch (e: any) {
     console.error(
@@ -1681,7 +1961,7 @@ bot.on("document", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  if (!(await ensureAuthorizedUser(ctx, userId))) {
+  if (await handleUnauthorizedMediaAttempt(ctx, userId, "document")) {
     return;
   }
 
@@ -1707,9 +1987,10 @@ bot.on("document", async (ctx: Context) => {
   try {
     await applyDelay(userId);
     const document = message.document;
-    await ctx.telegram.sendDocument(target, document.file_id, {
+    const sent = await ctx.telegram.sendDocument(target, document.file_id, {
       caption: message.caption || undefined,
     });
+    await saveForwardLog(userId, target, sent, "document");
     console.log(`[DOCUMENT] Forwarded from ${userId} to ${target}`);
   } catch (e: any) {
     console.error(
@@ -1739,7 +2020,7 @@ bot.on("audio", async (ctx: Context) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  if (!(await ensureAuthorizedUser(ctx, userId))) {
+  if (await handleUnauthorizedMediaAttempt(ctx, userId, "audio")) {
     return;
   }
 
@@ -1765,9 +2046,10 @@ bot.on("audio", async (ctx: Context) => {
   try {
     await applyDelay(userId);
     const audio = message.audio;
-    await ctx.telegram.sendAudio(target, audio.file_id, {
+    const sent = await ctx.telegram.sendAudio(target, audio.file_id, {
       caption: message.caption || undefined,
     });
+    await saveForwardLog(userId, target, sent, "audio");
     console.log(`[AUDIO] Forwarded from ${userId} to ${target}`);
   } catch (e: any) {
     console.error(
@@ -1875,6 +2157,7 @@ bot.telegram
     { command: "status", description: "Check bot status" },
     { command: "live", description: "Check if bot is awake" },
     { command: "mystats", description: "Show my profile" },
+    { command: "user_info", description: "Reply to know sender" },
     { command: "refresh_profile", description: "Update profile data" },
     { command: "stats", description: "Show user stats (Admin)" },
     { command: "reply", description: "<id> <message> - Send message" },
