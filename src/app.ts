@@ -2074,6 +2074,63 @@ bot.on("audio", async (ctx: Context) => {
   }
 });
 
+// Video note (circle video) handler
+bot.on("video_note", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  if (await handleUnauthorizedMediaAttempt(ctx, userId, "video_note")) {
+    return;
+  }
+
+  // Check if bot is enabled
+  if (!botEnabled) {
+    return ctx.reply(
+      "🔴 Bot is currently OFFLINE. Media forwarding is suspended.",
+    );
+  }
+
+  const message = ctx.message as any;
+  if (!message?.video_note) {
+    return ctx.reply("Error: video_note message is undefined");
+  }
+
+  const target = await findTarget(userId);
+  if (!target) {
+    return ctx.reply(
+      "❌ No target configured.\n" + "Use /set_target <user_id> first.",
+    );
+  }
+
+  try {
+    await applyDelay(userId);
+    const videoNote = message.video_note;
+    const sent = await ctx.telegram.sendVideoNote(target, videoNote.file_id);
+    await saveForwardLog(userId, target, sent, "video_note");
+    console.log(`[VIDEO_NOTE] Forwarded from ${userId} to ${target}`);
+  } catch (e: any) {
+    console.error(
+      `[ERROR] Failed to forward video note from ${userId} to ${target}:`,
+      e?.description || e?.message,
+    );
+
+    if (e?.description?.includes("chat not found")) {
+      await ctx.reply(
+        "❌ Cannot send to target user.\n\n" +
+          "The recipient must start the bot first:\n" +
+          "1. They need to search for this bot\n" +
+          "2. Click /start\n" +
+          "3. Then you can send media to them",
+      );
+    } else {
+      await ctx.reply(
+        "❌ Failed to forward video note. Error: " +
+          (e?.description || "Unknown error"),
+      );
+    }
+  }
+});
+
 // Handle callback queries for set_target and change_target buttons
 bot.action(/^(set|change)_target_(\d+)$/, async (ctx: Context) => {
   const userId = ctx.from?.id;
