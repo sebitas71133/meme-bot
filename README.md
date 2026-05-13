@@ -67,6 +67,8 @@ npm start
 | `/ban_user`       | `/ban_user <id> [reason]`  | Ban a user from the bot          |
 | `/unban_user`     | `/unban_user <id>`         | Unban a user                     |
 | `/help`           | `/help`                    | Show all available commands      |
+| `/hide_user`      | `/hide_user <id>`          | hide a user                      |
+| `/show_user`      | `/show_user <id>`          | show a user                      |
 
 ## How It Works
 

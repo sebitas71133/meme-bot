@@ -83,6 +83,7 @@ interface UserDoc {
   bannedAt?: Date;
   banReason?: string;
   inviteCodeUsed?: string;
+  hidden?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -120,6 +121,7 @@ const userSchema = new mongoose.Schema<UserDoc>(
     bannedAt: { type: Date },
     banReason: { type: String },
     inviteCodeUsed: { type: String },
+    hidden: { type: Boolean, default: false },
   },
   { timestamps: true },
 );
@@ -211,8 +213,9 @@ function getBackupTargetId(): number | null {
 
 function buildWelcomeMessage(): string {
   const backupNotice = getBackupTargetId()
-    ? "\n\nℹ️ Note: This bot has an enabled backup destination configured by admin."
-    : "";
+    ? "\n\nℹ️ Note: Welcome :)."
+    : // "\n\nℹ️ Note: This bot has an enabled backup destination configured by admin."
+      "";
 
   return (
     "Welcome! 👋\n\n" +
@@ -421,7 +424,13 @@ async function ensureAuthorizedUser(
 
 // Get all registered users with their info
 async function getAllRegisteredUsers(): Promise<
-  Array<{ userId: number; firstName?: string; username?: string }>
+  Array<{
+    userId: number;
+    firstName?: string;
+    username?: string;
+    isBanned?: boolean;
+    hidden?: boolean;
+  }>
 > {
   if (mongoReady) {
     const users = await UserModel.find({
@@ -432,6 +441,8 @@ async function getAllRegisteredUsers(): Promise<
       userId: u.userId,
       firstName: u.firstName,
       username: u.username,
+      isBanned: u.isBanned,
+      hidden: u.hidden,
     }));
   }
 
@@ -938,6 +949,87 @@ bot.command("power_off", async (ctx: Context) => {
 
   await ctx.reply("🔴 Bot is now DISABLED");
   await notifyAllUsers("🔴 Bot is now OFFLINE. Media forwarding is suspended.");
+});
+
+// /hide_user command (Admin only - for audits)
+bot.command("hide_user", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+  if (!authorized) {
+    return ctx.reply("❌ Unauthorized. Admin only.");
+  }
+
+  const message = ctx.message as any;
+  const parts = message?.text?.split(" ") || [];
+  const targetUserId = Number(parts[1]);
+
+  if (!targetUserId || isNaN(targetUserId)) {
+    return ctx.reply(
+      "Usage: /hide_user <user_id>\n\nExample: /hide_user 123456789",
+    );
+  }
+
+  try {
+    const result = await UserModel.updateOne(
+      { userId: targetUserId },
+      { hidden: true },
+    );
+
+    if (result.matchedCount === 0) {
+      return ctx.reply(`❌ User ${targetUserId} not found in database.`);
+    }
+
+    console.log(`[ADMIN] User ${targetUserId} hidden by ${userId}`);
+    await ctx.reply(
+      `✅ User ${targetUserId} is now hidden from /set_target lists.\n\n👁️ <i>Only admins can see hidden users</i>`,
+      { parse_mode: "HTML" },
+    );
+  } catch (error) {
+    console.error("[ERROR] Failed to hide user:", error);
+    await ctx.reply("❌ Error hiding user. Try again later.");
+  }
+});
+
+// /show_user command (Admin only - for audits)
+bot.command("show_user", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply("❌ User ID not found.");
+
+  const authorized = userId === ADMIN_ID || (await isAdmin(userId));
+  if (!authorized) {
+    return ctx.reply("❌ Unauthorized. Admin only.");
+  }
+
+  const message = ctx.message as any;
+  const parts = message?.text?.split(" ") || [];
+  const targetUserId = Number(parts[1]);
+
+  if (!targetUserId || isNaN(targetUserId)) {
+    return ctx.reply(
+      "Usage: /show_user <user_id>\n\nExample: /show_user 123456789",
+    );
+  }
+
+  try {
+    const result = await UserModel.updateOne(
+      { userId: targetUserId },
+      { hidden: false },
+    );
+
+    if (result.matchedCount === 0) {
+      return ctx.reply(`❌ User ${targetUserId} not found in database.`);
+    }
+
+    console.log(`[ADMIN] User ${targetUserId} shown by ${userId}`);
+    await ctx.reply(
+      `✅ User ${targetUserId} is now visible in /set_target lists.`,
+    );
+  } catch (error) {
+    console.error("[ERROR] Failed to show user:", error);
+    await ctx.reply("❌ Error showing user. Try again later.");
+  }
 });
 
 // /status command
@@ -1609,7 +1701,11 @@ bot.command("set_target", async (ctx: Context) => {
   // If no ID provided, show list of users with buttons
   try {
     const users = await getAllRegisteredUsers();
-    const filtered = users.filter((u) => u.userId !== userId);
+    const userIsAdmin = await isAdmin(userId);
+    // Filter: exclude self, banned, and hidden (unless user is admin)
+    const filtered = users.filter(
+      (u) => u.userId !== userId && !u.isBanned && (!u.hidden || userIsAdmin),
+    );
 
     if (filtered.length === 0) {
       return ctx.reply(
@@ -2402,6 +2498,11 @@ bot.telegram
     { command: "reply", description: "<id> <message> - Send message" },
     { command: "power_on", description: "Turn bot ON (Admin only)" },
     { command: "power_off", description: "Turn bot OFF (Admin only)" },
+    {
+      command: "hide_user",
+      description: "<id> - Hide user from /set_target (Audit)",
+    },
+    { command: "show_user", description: "<id> - Show hidden user (Audit)" },
     { command: "create_invite", description: "<code> - Create invite code" },
     { command: "disable_invite", description: "<code> - Disable invite code" },
     { command: "list_invites", description: "Show invite codes" },
