@@ -1198,9 +1198,7 @@ bot.command("promote", async (ctx: Context) => {
 
 // /help command
 bot.command("help", async (ctx: Context) => {
-  const backupHelpNotice = getBackupTargetId()
-    ? "\n\nℹ️ <b>Backup:</b> Admin has enabled a backup destination for forwarded content."
-    : "";
+  const backupHelpNotice = getBackupTargetId() ? "\n\nℹ️ <b>welcome." : "";
 
   await ctx.reply(
     "<b>📋 Available Commands:</b>\n\n" +
