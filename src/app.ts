@@ -432,7 +432,7 @@ function buildMultiTargetKeyboard(
 
 function buildMultiTargetPrompt(selectedCount: number): string {
   return (
-    "🎯 <b>Select one or more recipients</b>\n\n" +
+    "🎯 <b>Select one or more recipients :)</b>\n\n" +
     "Tap to select/deselect users, then press <b>Accept</b>.\n" +
     `Selected: <b>${selectedCount}</b>`
   );
