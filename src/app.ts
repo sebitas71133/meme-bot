@@ -422,19 +422,19 @@ function buildMultiTargetKeyboard(
   }
 
   buttons.push([
-    { text: "✅ Aceptar", callback_data: "multi_target_accept" },
-    { text: "🧹 Limpiar", callback_data: "multi_target_clear" },
+    { text: "✅ Accept", callback_data: "multi_target_accept" },
+    { text: "🧹 Clear", callback_data: "multi_target_clear" },
   ]);
-  buttons.push([{ text: "❌ Cancelar", callback_data: "multi_target_cancel" }]);
+  buttons.push([{ text: "❌ Cancel", callback_data: "multi_target_cancel" }]);
 
   return buttons;
 }
 
 function buildMultiTargetPrompt(selectedCount: number): string {
   return (
-    "🎯 <b>Selecciona uno o más destinatarios</b>\n\n" +
-    "Toca para marcar/desmarcar usuarios y luego pulsa <b>Aceptar</b>.\n" +
-    `Seleccionados: <b>${selectedCount}</b>`
+    "🎯 <b>Select one or more recipients</b>\n\n" +
+    "Tap to select/deselect users, then press <b>Accept</b>.\n" +
+    `Selected: <b>${selectedCount}</b>`
   );
 }
 
@@ -1916,8 +1916,8 @@ bot.command("set_multi_target", async (ctx: Context) => {
 
     if (filtered.length === 0) {
       return ctx.reply(
-        "❌ No hay usuarios disponibles para seleccionar.\n\n" +
-          "Otros usuarios deben iniciar el bot primero.",
+        "❌ No users are available to select.\n\n" +
+          "Other users must start the bot first.",
       );
     }
 
@@ -1933,7 +1933,7 @@ bot.command("set_multi_target", async (ctx: Context) => {
     });
   } catch (error) {
     console.error("[ERROR] Failed to initialize multi-target selector:", error);
-    return ctx.reply("❌ Error cargando usuarios para selección múltiple.");
+    return ctx.reply("❌ Error loading users for multi-target selection.");
   }
 });
 
@@ -2860,7 +2860,7 @@ bot.action(/^multi_target_toggle_(\d+)$/, async (ctx: Context) => {
   const selected = pendingMultiTargetSelections.get(userId);
   if (!selected) {
     return ctx.answerCbQuery(
-      "No hay una selección activa. Usa /set_multi_target.",
+      "There is no active selection. Use /set_multi_target.",
       { show_alert: true },
     );
   }
@@ -2869,7 +2869,7 @@ bot.action(/^multi_target_toggle_(\d+)$/, async (ctx: Context) => {
   const targetId = Number(match[1]);
 
   if (targetId === userId) {
-    return ctx.answerCbQuery("No puedes seleccionarte a ti mismo.", {
+    return ctx.answerCbQuery("You cannot select yourself.", {
       show_alert: true,
     });
   }
@@ -2900,7 +2900,7 @@ bot.action("multi_target_clear", async (ctx: Context) => {
   const selected = pendingMultiTargetSelections.get(userId);
   if (!selected) {
     return ctx.answerCbQuery(
-      "No hay una selección activa. Usa /set_multi_target.",
+      "There is no active selection. Use /set_multi_target.",
       { show_alert: true },
     );
   }
@@ -2916,7 +2916,7 @@ bot.action("multi_target_clear", async (ctx: Context) => {
     },
   });
 
-  return ctx.answerCbQuery("Selección limpiada");
+  return ctx.answerCbQuery("Selection cleared");
 });
 
 bot.action("multi_target_cancel", async (ctx: Context) => {
@@ -2924,7 +2924,7 @@ bot.action("multi_target_cancel", async (ctx: Context) => {
   if (!userId) return;
 
   pendingMultiTargetSelections.delete(userId);
-  await ctx.editMessageText("❌ Selección múltiple cancelada.");
+  await ctx.editMessageText("❌ Multi-target selection canceled.");
   return ctx.answerCbQuery();
 });
 
@@ -2935,17 +2935,16 @@ bot.action("multi_target_accept", async (ctx: Context) => {
   const selected = pendingMultiTargetSelections.get(userId);
   if (!selected) {
     return ctx.answerCbQuery(
-      "No hay una selección activa. Usa /set_multi_target.",
+      "There is no active selection. Use /set_multi_target.",
       { show_alert: true },
     );
   }
 
   const selectedIds = Array.from(selected.values());
   if (!selectedIds.length) {
-    return ctx.answerCbQuery(
-      "Selecciona al menos un usuario antes de aceptar.",
-      { show_alert: true },
-    );
+    return ctx.answerCbQuery("Select at least one user before accepting.", {
+      show_alert: true,
+    });
   }
 
   await setTargets(userId, selectedIds);
@@ -2969,8 +2968,7 @@ bot.action("multi_target_accept", async (ctx: Context) => {
   }
 
   await ctx.editMessageText(
-    "✅ <b>Destinatarios múltiples configurados</b>\n\n" +
-      `${lines.join("\n")}`,
+    "✅ <b>Multiple recipients configured</b>\n\n" + `${lines.join("\n")}`,
     { parse_mode: "HTML" },
   );
 
