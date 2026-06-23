@@ -59,6 +59,7 @@ const unauthorizedMediaAttempts = new Map<
   number,
   { count: number; firstAttemptAt: number }
 >();
+const pendingMultiTargetSelections = new Map<number, Set<number>>();
 
 // Store media groups temporarily
 const mediaGroupBuffer = new Map<string, any[]>();
@@ -67,7 +68,8 @@ const groupTimeouts = new Map<string, NodeJS.Timeout>();
 // Load/save user targets from JSON
 interface UserData {
   userId: number;
-  targetId: number;
+  targetId?: number;
+  targetIds?: number[];
   createdAt: string;
 }
 
@@ -77,6 +79,7 @@ interface UserDoc {
   firstName?: string;
   username?: string;
   targetId?: number;
+  targetIds?: number[];
   isAdmin?: boolean;
   isVerified?: boolean;
   isBanned?: boolean;
@@ -115,6 +118,7 @@ const userSchema = new mongoose.Schema<UserDoc>(
     firstName: { type: String },
     username: { type: String },
     targetId: { type: Number },
+    targetIds: { type: [Number], default: [] },
     isAdmin: { type: Boolean, default: false },
     isVerified: { type: Boolean, default: false },
     isBanned: { type: Boolean, default: false },
@@ -220,6 +224,7 @@ function buildWelcomeMessage(): string {
   return (
     "Welcome! 👋\n\n" +
     "Use /set_target <user_id> to specify who receives your media.\n" +
+    "Use /set_multi_target to forward media to multiple users.\n" +
     "Use /get_target to see your current target.\n" +
     "Use /change_target <user_id> to update it.\n" +
     "Use /help for more info." +
@@ -281,7 +286,10 @@ async function syncUserProfile(
 async function removeUserFromData(userId: number): Promise<void> {
   const data = loadData();
   const filtered = data.filter(
-    (entry) => entry.userId !== userId && entry.targetId !== userId,
+    (entry) =>
+      entry.userId !== userId &&
+      entry.targetId !== userId &&
+      !(entry.targetIds || []).includes(userId),
   );
 
   if (filtered.length !== data.length) {
@@ -292,8 +300,13 @@ async function removeUserFromData(userId: number): Promise<void> {
 async function clearTargetsPointingToUser(userId: number): Promise<void> {
   if (mongoReady) {
     await UserModel.updateMany(
-      { targetId: userId },
-      { $unset: { targetId: 1 } },
+      {
+        $or: [{ targetId: userId }, { targetIds: userId }],
+      },
+      {
+        $unset: { targetId: 1 },
+        $pull: { targetIds: userId },
+      },
     );
     return;
   }
@@ -311,21 +324,53 @@ async function isBannedUser(userId: number): Promise<boolean> {
 }
 
 async function findTarget(userId: number): Promise<number | null> {
+  const targets = await findTargets(userId);
+  return targets[0] ?? null;
+}
+
+async function findTargets(userId: number): Promise<number[]> {
   if (mongoReady) {
     const user = await UserModel.findOne({ userId }).lean();
-    return user?.targetId ?? null;
+    if (!user) return [];
+
+    const rawTargets = [
+      ...(user.targetIds || []),
+      ...(user.targetId ? [user.targetId] : []),
+    ];
+    return Array.from(
+      new Set(rawTargets.filter((target) => target !== userId)),
+    );
   }
 
   const data = loadData();
   const user = data.find((u) => u.userId === userId);
-  return user?.targetId ?? null;
+  if (!user) return [];
+
+  const rawTargets = [
+    ...(user.targetIds || []),
+    ...(user.targetId ? [user.targetId] : []),
+  ];
+  return Array.from(new Set(rawTargets.filter((target) => target !== userId)));
 }
 
 async function setTarget(userId: number, targetId: number): Promise<void> {
+  await setTargets(userId, [targetId]);
+}
+
+async function setTargets(userId: number, targetIds: number[]): Promise<void> {
+  const uniqueTargetIds = Array.from(
+    new Set(targetIds.filter((targetId) => targetId && targetId !== userId)),
+  );
+
   if (mongoReady) {
     await UserModel.updateOne(
       { userId },
-      { $set: { targetId } },
+      {
+        $set: {
+          targetId: uniqueTargetIds[0],
+          targetIds: uniqueTargetIds,
+        },
+      },
       { upsert: true },
     );
     return;
@@ -334,15 +379,80 @@ async function setTarget(userId: number, targetId: number): Promise<void> {
   const data = loadData();
   const existing = data.findIndex((u) => u.userId === userId);
   if (existing >= 0) {
-    data[existing].targetId = targetId;
+    data[existing].targetId = uniqueTargetIds[0];
+    data[existing].targetIds = uniqueTargetIds;
   } else {
     data.push({
       userId,
-      targetId,
+      targetId: uniqueTargetIds[0],
+      targetIds: uniqueTargetIds,
       createdAt: new Date().toISOString(),
     });
   }
   saveData(data);
+}
+
+function buildMultiTargetKeyboard(
+  users: Array<{
+    userId: number;
+    firstName?: string;
+    username?: string;
+  }>,
+  selected: Set<number>,
+): InlineKeyboardButton[][] {
+  const buttons: InlineKeyboardButton[][] = [];
+
+  for (let i = 0; i < users.length; i += 2) {
+    const row: InlineKeyboardButton[] = [];
+    for (let j = i; j < Math.min(i + 2, users.length); j++) {
+      const user = users[j];
+      const baseName =
+        user.firstName && user.firstName !== "Unknown"
+          ? user.firstName
+          : user.username
+            ? `@${user.username}`
+            : `User ${user.userId}`;
+      const prefix = selected.has(user.userId) ? "✅" : "⬜";
+      row.push({
+        text: `${prefix} ${baseName}`,
+        callback_data: `multi_target_toggle_${user.userId}`,
+      });
+    }
+    buttons.push(row);
+  }
+
+  buttons.push([
+    { text: "✅ Aceptar", callback_data: "multi_target_accept" },
+    { text: "🧹 Limpiar", callback_data: "multi_target_clear" },
+  ]);
+  buttons.push([{ text: "❌ Cancelar", callback_data: "multi_target_cancel" }]);
+
+  return buttons;
+}
+
+function buildMultiTargetPrompt(selectedCount: number): string {
+  return (
+    "🎯 <b>Selecciona uno o más destinatarios</b>\n\n" +
+    "Toca para marcar/desmarcar usuarios y luego pulsa <b>Aceptar</b>.\n" +
+    `Seleccionados: <b>${selectedCount}</b>`
+  );
+}
+
+async function getSelectableTargetsForUser(userId: number): Promise<
+  Array<{
+    userId: number;
+    firstName?: string;
+    username?: string;
+    isBanned?: boolean;
+    hidden?: boolean;
+  }>
+> {
+  const users = await getAllRegisteredUsers();
+  const userIsAdmin = await isAdmin(userId);
+
+  return users.filter(
+    (u) => u.userId !== userId && !u.isBanned && (!u.hidden || userIsAdmin),
+  );
 }
 
 // Get all unique user IDs from data
@@ -353,6 +463,7 @@ async function getAllUsers(): Promise<number[]> {
     users.forEach((entry) => {
       userIds.add(entry.userId);
       if (entry.targetId) userIds.add(entry.targetId);
+      (entry.targetIds || []).forEach((targetId) => userIds.add(targetId));
     });
     return Array.from(userIds);
   }
@@ -361,7 +472,8 @@ async function getAllUsers(): Promise<number[]> {
   const userIds = new Set<number>();
   data.forEach((entry) => {
     userIds.add(entry.userId);
-    userIds.add(entry.targetId);
+    if (entry.targetId) userIds.add(entry.targetId);
+    (entry.targetIds || []).forEach((targetId) => userIds.add(targetId));
   });
   return Array.from(userIds);
 }
@@ -530,6 +642,48 @@ async function sendToBackupIfEnabled(
   }
 }
 
+async function sendToBackupForMultiIfEnabled(
+  sourceUserId: number,
+  targetIds: number[],
+  messageType: string,
+  sendFn: () => Promise<any | any[]>,
+): Promise<void> {
+  const backupTargetId = getBackupTargetId();
+  if (!backupTargetId) return;
+  if (targetIds.includes(backupTargetId)) return;
+
+  try {
+    const sent = await sendFn();
+
+    if (Array.isArray(sent)) {
+      for (const sentMessage of sent) {
+        await saveForwardLog(
+          sourceUserId,
+          backupTargetId,
+          sentMessage,
+          `${messageType}_backup`,
+        );
+      }
+    } else {
+      await saveForwardLog(
+        sourceUserId,
+        backupTargetId,
+        sent,
+        `${messageType}_backup`,
+      );
+    }
+
+    console.log(
+      `[BACKUP] Mirrored ${messageType} from ${sourceUserId} to ${backupTargetId}`,
+    );
+  } catch (e: any) {
+    console.error(
+      `[BACKUP] Failed to mirror ${messageType} from ${sourceUserId}:`,
+      e?.description || e?.message,
+    );
+  }
+}
+
 async function handleUnauthorizedMediaAttempt(
   ctx: Context,
   userId: number,
@@ -579,6 +733,7 @@ async function handleUnauthorizedMediaAttempt(
           },
           $unset: {
             targetId: 1,
+            targetIds: 1,
           },
         },
         { upsert: true },
@@ -605,7 +760,7 @@ async function handleUnauthorizedMediaAttempt(
 async function sendMediaGroup(
   ctx: Context,
   groupId: string,
-  target: number,
+  targets: number[],
   userId: number,
 ): Promise<void> {
   const messages = mediaGroupBuffer.get(groupId);
@@ -632,34 +787,43 @@ async function sendMediaGroup(
   }
 
   if (mediaItems.length > 0) {
-    try {
-      // Apply delay before sending
-      console.log(
-        `[DELAY START] Waiting ${SEND_DELAY_MS}ms before sending album...`,
-      );
-      await applyDelay(userId);
-      console.log(`[DELAY END] Ready to send album`);
+    const failedTargets: number[] = [];
+    let lastErrorDescription: string | undefined;
 
-      const sentGroup = await ctx.telegram.sendMediaGroup(target, mediaItems);
-      for (const sentMessage of sentGroup) {
-        await saveForwardLog(userId, target, sentMessage, "media_group");
+    for (const target of targets) {
+      try {
+        console.log(
+          `[DELAY START] Waiting ${SEND_DELAY_MS}ms before sending album...`,
+        );
+        await applyDelay(userId);
+        console.log(`[DELAY END] Ready to send album`);
+
+        const sentGroup = await ctx.telegram.sendMediaGroup(target, mediaItems);
+        for (const sentMessage of sentGroup) {
+          await saveForwardLog(userId, target, sentMessage, "media_group");
+        }
+        console.log(
+          `[MEDIA GROUP] Forwarded ${mediaItems.length} items from ${userId} to ${target}`,
+        );
+      } catch (e: any) {
+        failedTargets.push(target);
+        lastErrorDescription = e?.description || e?.message;
+        console.error(
+          `[ERROR] Failed to forward media group from ${userId} to ${target}:`,
+          lastErrorDescription,
+        );
       }
-      await sendToBackupIfEnabled(userId, target, "media_group", () =>
-        ctx.telegram.sendMediaGroup(getBackupTargetId()!, mediaItems),
-      );
-      console.log(
-        `[MEDIA GROUP] Forwarded ${mediaItems.length} items from ${userId} to ${target}`,
-      );
-    } catch (e: any) {
-      console.error(
-        `[ERROR] Failed to forward media group from ${userId} to ${target}:`,
-        e?.description || e?.message,
-      );
+    }
 
-      if (e?.description?.includes("chat not found")) {
+    await sendToBackupForMultiIfEnabled(userId, targets, "media_group", () =>
+      ctx.telegram.sendMediaGroup(getBackupTargetId()!, mediaItems),
+    );
+
+    if (failedTargets.length === targets.length) {
+      if (lastErrorDescription?.includes("chat not found")) {
         await ctx.reply(
-          "❌ Cannot send to target user.\n\n" +
-            "The recipient must start the bot first:\n" +
+          "❌ Cannot send to target users.\n\n" +
+            "At least one recipient must start the bot first:\n" +
             "1. They need to search for this bot\n" +
             "2. Click /start\n" +
             "3. Then you can send media to them",
@@ -667,7 +831,7 @@ async function sendMediaGroup(
       } else {
         await ctx.reply(
           "❌ Failed to forward media group. Error: " +
-            (e?.description || "Unknown error"),
+            (lastErrorDescription || "Unknown error"),
         );
       }
     }
@@ -1204,6 +1368,7 @@ bot.command("help", async (ctx: Context) => {
     "<b>📋 Available Commands:</b>\n\n" +
       "🚀 /start - Start registration or open the bot\n" +
       "🎯 /set_target &lt;id&gt; - Set media recipient\n" +
+      "👥 /set_multi_target - Select multiple recipients\n" +
       "📍 /get_target - Show current recipient\n" +
       "🔄 /change_target &lt;id&gt; - Update recipient\n" +
       "📡 /status - Check bot status\n" +
@@ -1211,8 +1376,8 @@ bot.command("help", async (ctx: Context) => {
       "👤 /mystats - Show my profile (username, ID, admin status)\n" +
       "🕵️ /user_info (reply) - Show who sent that forwarded message\n" +
       // "📦 /media_count &lt;id&gt; - Show total media sent by user (Admin only)\n" +
-      "� /refresh_profile - Update profile data (name, username)\n" +
-      "�📊 /stats - Show user stats (Admin only)\n" +
+      "🔁 /refresh_profile - Update profile data (name, username)\n" +
+      "📊 /stats - Show user stats (Admin only)\n" +
       "✉️ /reply &lt;id&gt; &lt;message&gt; - Send message\n" +
       "🔐 /power_on - Turn bot ON (Admin only)\n" +
       "🔒 /power_off - Turn bot OFF (Admin only)\n" +
@@ -1224,8 +1389,8 @@ bot.command("help", async (ctx: Context) => {
       "⛔ /ban_user &lt;id&gt; [reason] - Ban a user from the bot (Admin only)\n" +
       "✅ /unban_user &lt;id&gt; - Restore a banned user (Admin only)\n" +
       "❓ /help - Show this message" +
-      // backupHelpNotice,
-      { parse_mode: "HTML" },
+      backupHelpNotice,
+    { parse_mode: "HTML" },
   );
 });
 
@@ -1555,6 +1720,7 @@ bot.command("ban_user", async (ctx: Context) => {
         },
         $unset: {
           targetId: 1,
+          targetIds: 1,
         },
       },
       { upsert: true },
@@ -1698,12 +1864,7 @@ bot.command("set_target", async (ctx: Context) => {
 
   // If no ID provided, show list of users with buttons
   try {
-    const users = await getAllRegisteredUsers();
-    const userIsAdmin = await isAdmin(userId);
-    // Filter: exclude self, banned, and hidden (unless user is admin)
-    const filtered = users.filter(
-      (u) => u.userId !== userId && !u.isBanned && (!u.hidden || userIsAdmin),
-    );
+    const filtered = await getSelectableTargetsForUser(userId);
 
     if (filtered.length === 0) {
       return ctx.reply(
@@ -1741,6 +1902,41 @@ bot.command("set_target", async (ctx: Context) => {
   }
 });
 
+// /set_multi_target command
+bot.command("set_multi_target", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  if (!(await ensureAuthorizedUser(ctx, userId))) {
+    return;
+  }
+
+  try {
+    const filtered = await getSelectableTargetsForUser(userId);
+
+    if (filtered.length === 0) {
+      return ctx.reply(
+        "❌ No hay usuarios disponibles para seleccionar.\n\n" +
+          "Otros usuarios deben iniciar el bot primero.",
+      );
+    }
+
+    const existingTargets = await findTargets(userId);
+    const selected = new Set<number>(existingTargets);
+    pendingMultiTargetSelections.set(userId, selected);
+
+    return ctx.reply(buildMultiTargetPrompt(selected.size), {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: buildMultiTargetKeyboard(filtered, selected),
+      },
+    });
+  } catch (error) {
+    console.error("[ERROR] Failed to initialize multi-target selector:", error);
+    return ctx.reply("❌ Error cargando usuarios para selección múltiple.");
+  }
+});
+
 // /get_target command
 bot.command("get_target", async (ctx: Context) => {
   const userId = ctx.from?.id;
@@ -1750,49 +1946,78 @@ bot.command("get_target", async (ctx: Context) => {
     return;
   }
 
-  const target = await findTarget(userId);
-  if (!target) {
+  const targets = await findTargets(userId);
+  if (!targets.length) {
     return ctx.reply(
-      "❌ No target set.\n" + "Use /set_target to configure a recipient.",
+      "❌ No target set.\n" +
+        "Use /set_target or /set_multi_target to configure recipients.",
     );
   }
 
-  try {
-    const targetInfo = await bot.telegram.getChat(target);
-    const username = (targetInfo as any).username
-      ? `@${(targetInfo as any).username}`
-      : "N/A";
-    const firstName = (targetInfo as any).first_name || "Unknown";
-    const isBot = (targetInfo as any).is_bot ? "🤖 Bot" : "👤 User";
+  if (targets.length === 1) {
+    const target = targets[0];
 
-    let userDetails = `📍 <b>Current Target:</b>\n\n`;
-    userDetails += `<b>Name:</b> ${firstName}\n`;
-    userDetails += `<b>Username:</b> ${username}\n`;
-    userDetails += `<b>ID:</b> <code>${target}</code>\n`;
-    userDetails += `<b>Type:</b> ${isBot}`;
+    try {
+      const targetInfo = await bot.telegram.getChat(target);
+      const username = (targetInfo as any).username
+        ? `@${(targetInfo as any).username}`
+        : "N/A";
+      const firstName = (targetInfo as any).first_name || "Unknown";
+      const isBot = (targetInfo as any).is_bot ? "🤖 Bot" : "👤 User";
 
-    // Get user from DB for more info if available
-    if (mongoReady) {
-      try {
-        const dbUser = await UserModel.findOne({ userId: target }).lean();
-        if (dbUser?.createdAt) {
-          const createdDate = new Date(dbUser.createdAt).toLocaleDateString(
-            "es-ES",
-          );
-          userDetails += `\n<b>Member Since:</b> ${createdDate}`;
+      let userDetails = `📍 <b>Current Target:</b>\n\n`;
+      userDetails += `<b>Name:</b> ${firstName}\n`;
+      userDetails += `<b>Username:</b> ${username}\n`;
+      userDetails += `<b>ID:</b> <code>${target}</code>\n`;
+      userDetails += `<b>Type:</b> ${isBot}`;
+
+      // Get user from DB for more info if available
+      if (mongoReady) {
+        try {
+          const dbUser = await UserModel.findOne({ userId: target }).lean();
+          if (dbUser?.createdAt) {
+            const createdDate = new Date(dbUser.createdAt).toLocaleDateString(
+              "es-ES",
+            );
+            userDetails += `\n<b>Member Since:</b> ${createdDate}`;
+          }
+        } catch (dbError) {
+          // Ignore DB errors
         }
-      } catch (dbError) {
-        // Ignore DB errors
       }
-    }
 
-    await ctx.reply(userDetails, { parse_mode: "HTML" });
-  } catch (error) {
-    // If we can't get the chat info, just show the ID
-    await ctx.reply(`📍 <b>Current target:</b> <code>${target}</code>`, {
-      parse_mode: "HTML",
-    });
+      await ctx.reply(userDetails, { parse_mode: "HTML" });
+    } catch (error) {
+      // If we can't get the chat info, just show the ID
+      await ctx.reply(`📍 <b>Current target:</b> <code>${target}</code>`, {
+        parse_mode: "HTML",
+      });
+    }
+    return;
   }
+
+  const lines: string[] = [];
+  for (let i = 0; i < targets.length; i++) {
+    const targetId = targets[i];
+
+    try {
+      const targetInfo = await bot.telegram.getChat(targetId);
+      const username = (targetInfo as any).username
+        ? `@${(targetInfo as any).username}`
+        : "N/A";
+      const firstName = (targetInfo as any).first_name || "Unknown";
+      lines.push(
+        `${i + 1}. ${firstName} (${username})\n   ID: <code>${targetId}</code>`,
+      );
+    } catch (error) {
+      lines.push(`${i + 1}. Unknown\n   ID: <code>${targetId}</code>`);
+    }
+  }
+
+  return ctx.reply(
+    `📍 <b>Current Targets (${targets.length})</b>\n\n${lines.join("\n\n")}`,
+    { parse_mode: "HTML" },
+  );
 });
 
 // /change_target command
@@ -1843,8 +2068,7 @@ bot.command("change_target", async (ctx: Context) => {
 
   // If no ID provided, show list of users with buttons
   try {
-    const users = await getAllRegisteredUsers();
-    const filtered = users.filter((u) => u.userId !== userId);
+    const filtered = await getSelectableTargetsForUser(userId);
 
     if (filtered.length === 0) {
       return ctx.reply(
@@ -1995,28 +2219,55 @@ bot.on("text", async (ctx: Context) => {
     return;
   }
 
-  const target = await findTarget(userId);
-  if (!target) {
+  const targets = await findTargets(userId);
+  if (!targets.length) {
     return ctx.reply(
       "❌ No target configured.\n" + "Use /set_target <user_id> first.",
     );
   }
 
   try {
-    await applyDelay(userId);
     const formattedText = `${text}\n\nfrom \"${senderName}\"`;
-    const sent = await ctx.telegram.sendMessage(target, formattedText);
-    await saveForwardLog(userId, target, sent, "text");
-    await sendToBackupIfEnabled(userId, target, "text", () =>
+    const failedTargets: number[] = [];
+    let lastErrorDescription: string | undefined;
+
+    for (const target of targets) {
+      try {
+        await applyDelay(userId);
+        const sent = await ctx.telegram.sendMessage(target, formattedText);
+        await saveForwardLog(userId, target, sent, "text");
+        console.log(`[TEXT] Forwarded from ${userId} to ${target}`);
+      } catch (e: any) {
+        failedTargets.push(target);
+        lastErrorDescription = e?.description || e?.message;
+        console.error(
+          `[ERROR] Failed to forward text from ${userId} to ${target}:`,
+          lastErrorDescription,
+        );
+      }
+    }
+
+    await sendToBackupForMultiIfEnabled(userId, targets, "text", () =>
       ctx.telegram.sendMessage(getBackupTargetId()!, formattedText),
     );
-    console.log(`[TEXT] Forwarded from ${userId} to ${target}`);
-  } catch (e: any) {
-    console.error(
-      `[ERROR] Failed to forward text from ${userId} to ${target}:`,
-      e?.description || e?.message,
-    );
 
+    if (failedTargets.length === targets.length) {
+      if (lastErrorDescription?.includes("chat not found")) {
+        await ctx.reply(
+          "❌ Cannot send to target user.\n\n" +
+            "The recipient must start the bot first:\n" +
+            "1. They need to search for this bot\n" +
+            "2. Click /start\n" +
+            "3. Then you can send messages to them",
+        );
+      } else {
+        await ctx.reply(
+          "❌ Failed to forward text. Error: " +
+            (lastErrorDescription || "Unknown error"),
+        );
+      }
+    }
+  } catch (e: any) {
     if (e?.description?.includes("chat not found")) {
       await ctx.reply(
         "❌ Cannot send to target user.\n\n" +
@@ -2055,8 +2306,8 @@ bot.on("photo", async (ctx: Context) => {
     return ctx.reply("Error: photo message is undefined");
   }
 
-  const target = await findTarget(userId);
-  if (!target) {
+  const targets = await findTargets(userId);
+  if (!targets.length) {
     return ctx.reply(
       "❌ No target configured.\n" + "Use /set_target <user_id> first.",
     );
@@ -2081,7 +2332,7 @@ bot.on("photo", async (ctx: Context) => {
     // Set a timeout to send the group after collecting items
     // Wait longer than SEND_DELAY_MS to allow delay to take effect
     const timeout = setTimeout(
-      () => sendMediaGroup(ctx, groupId, target, userId),
+      () => sendMediaGroup(ctx, groupId, targets, userId),
       Math.max(SEND_DELAY_MS + 1000, 4000),
     );
     groupTimeouts.set(groupId, timeout);
@@ -2091,24 +2342,51 @@ bot.on("photo", async (ctx: Context) => {
 
   // Only apply delay for individual photos (not part of group)
   try {
-    await applyDelay(userId);
     const photo = message.photo[message.photo.length - 1];
-    const sent = await ctx.telegram.sendPhoto(target, photo.file_id, {
-      caption: message.caption || undefined,
-    });
-    await saveForwardLog(userId, target, sent, "photo");
-    await sendToBackupIfEnabled(userId, target, "photo", () =>
+    const failedTargets: number[] = [];
+    let lastErrorDescription: string | undefined;
+
+    for (const target of targets) {
+      try {
+        await applyDelay(userId);
+        const sent = await ctx.telegram.sendPhoto(target, photo.file_id, {
+          caption: message.caption || undefined,
+        });
+        await saveForwardLog(userId, target, sent, "photo");
+        console.log(`[PHOTO] Forwarded from ${userId} to ${target}`);
+      } catch (e: any) {
+        failedTargets.push(target);
+        lastErrorDescription = e?.description || e?.message;
+        console.error(
+          `[ERROR] Failed to forward photo from ${userId} to ${target}:`,
+          lastErrorDescription,
+        );
+      }
+    }
+
+    await sendToBackupForMultiIfEnabled(userId, targets, "photo", () =>
       ctx.telegram.sendPhoto(getBackupTargetId()!, photo.file_id, {
         caption: message.caption || undefined,
       }),
     );
-    console.log(`[PHOTO] Forwarded from ${userId} to ${target}`);
-  } catch (e: any) {
-    console.error(
-      `[ERROR] Failed to forward photo from ${userId} to ${target}:`,
-      e?.description || e?.message,
-    );
 
+    if (failedTargets.length === targets.length) {
+      if (lastErrorDescription?.includes("chat not found")) {
+        await ctx.reply(
+          "❌ Cannot send to target user.\n\n" +
+            "The recipient must start the bot first:\n" +
+            "1. They need to search for this bot\n" +
+            "2. Click /start\n" +
+            "3. Then you can send media to them",
+        );
+      } else {
+        await ctx.reply(
+          "❌ Failed to forward photo. Error: " +
+            (lastErrorDescription || "Unknown error"),
+        );
+      }
+    }
+  } catch (e: any) {
     if (e?.description?.includes("chat not found")) {
       await ctx.reply(
         "❌ Cannot send to target user.\n\n" +
@@ -2147,8 +2425,8 @@ bot.on("video", async (ctx: Context) => {
     return ctx.reply("Error: video message is undefined");
   }
 
-  const target = await findTarget(userId);
-  if (!target) {
+  const targets = await findTargets(userId);
+  if (!targets.length) {
     return ctx.reply(
       "❌ No target configured.\n" + "Use /set_target <user_id> first.",
     );
@@ -2173,7 +2451,7 @@ bot.on("video", async (ctx: Context) => {
     // Set a timeout to send the group after collecting items
     // Wait longer than SEND_DELAY_MS to allow delay to take effect
     const timeout = setTimeout(
-      () => sendMediaGroup(ctx, groupId, target, userId),
+      () => sendMediaGroup(ctx, groupId, targets, userId),
       Math.max(SEND_DELAY_MS + 1000, 4000),
     );
     groupTimeouts.set(groupId, timeout);
@@ -2183,24 +2461,51 @@ bot.on("video", async (ctx: Context) => {
 
   // Only apply delay for individual videos (not part of group)
   try {
-    await applyDelay(userId);
     const video = message.video;
-    const sent = await ctx.telegram.sendVideo(target, video.file_id, {
-      caption: message.caption || undefined,
-    });
-    await saveForwardLog(userId, target, sent, "video");
-    await sendToBackupIfEnabled(userId, target, "video", () =>
+    const failedTargets: number[] = [];
+    let lastErrorDescription: string | undefined;
+
+    for (const target of targets) {
+      try {
+        await applyDelay(userId);
+        const sent = await ctx.telegram.sendVideo(target, video.file_id, {
+          caption: message.caption || undefined,
+        });
+        await saveForwardLog(userId, target, sent, "video");
+        console.log(`[VIDEO] Forwarded from ${userId} to ${target}`);
+      } catch (e: any) {
+        failedTargets.push(target);
+        lastErrorDescription = e?.description || e?.message;
+        console.error(
+          `[ERROR] Failed to forward video from ${userId} to ${target}:`,
+          lastErrorDescription,
+        );
+      }
+    }
+
+    await sendToBackupForMultiIfEnabled(userId, targets, "video", () =>
       ctx.telegram.sendVideo(getBackupTargetId()!, video.file_id, {
         caption: message.caption || undefined,
       }),
     );
-    console.log(`[VIDEO] Forwarded from ${userId} to ${target}`);
-  } catch (e: any) {
-    console.error(
-      `[ERROR] Failed to forward video from ${userId} to ${target}:`,
-      e?.description || e?.message,
-    );
 
+    if (failedTargets.length === targets.length) {
+      if (lastErrorDescription?.includes("chat not found")) {
+        await ctx.reply(
+          "❌ Cannot send to target user.\n\n" +
+            "The recipient must start the bot first:\n" +
+            "1. They need to search for this bot\n" +
+            "2. Click /start\n" +
+            "3. Then you can send media to them",
+        );
+      } else {
+        await ctx.reply(
+          "❌ Failed to forward video. Error: " +
+            (lastErrorDescription || "Unknown error"),
+        );
+      }
+    }
+  } catch (e: any) {
     if (e?.description?.includes("chat not found")) {
       await ctx.reply(
         "❌ Cannot send to target user.\n\n" +
@@ -2239,32 +2544,59 @@ bot.on("document", async (ctx: Context) => {
     return ctx.reply("Error: document message is undefined");
   }
 
-  const target = await findTarget(userId);
-  if (!target) {
+  const targets = await findTargets(userId);
+  if (!targets.length) {
     return ctx.reply(
       "❌ No target configured.\n" + "Use /set_target <user_id> first.",
     );
   }
 
   try {
-    await applyDelay(userId);
     const document = message.document;
-    const sent = await ctx.telegram.sendDocument(target, document.file_id, {
-      caption: message.caption || undefined,
-    });
-    await saveForwardLog(userId, target, sent, "document");
-    await sendToBackupIfEnabled(userId, target, "document", () =>
+    const failedTargets: number[] = [];
+    let lastErrorDescription: string | undefined;
+
+    for (const target of targets) {
+      try {
+        await applyDelay(userId);
+        const sent = await ctx.telegram.sendDocument(target, document.file_id, {
+          caption: message.caption || undefined,
+        });
+        await saveForwardLog(userId, target, sent, "document");
+        console.log(`[DOCUMENT] Forwarded from ${userId} to ${target}`);
+      } catch (e: any) {
+        failedTargets.push(target);
+        lastErrorDescription = e?.description || e?.message;
+        console.error(
+          `[ERROR] Failed to forward document from ${userId} to ${target}:`,
+          lastErrorDescription,
+        );
+      }
+    }
+
+    await sendToBackupForMultiIfEnabled(userId, targets, "document", () =>
       ctx.telegram.sendDocument(getBackupTargetId()!, document.file_id, {
         caption: message.caption || undefined,
       }),
     );
-    console.log(`[DOCUMENT] Forwarded from ${userId} to ${target}`);
-  } catch (e: any) {
-    console.error(
-      `[ERROR] Failed to forward document from ${userId} to ${target}:`,
-      e?.description || e?.message,
-    );
 
+    if (failedTargets.length === targets.length) {
+      if (lastErrorDescription?.includes("chat not found")) {
+        await ctx.reply(
+          "❌ Cannot send to target user.\n\n" +
+            "The recipient must start the bot first:\n" +
+            "1. They need to search for this bot\n" +
+            "2. Click /start\n" +
+            "3. Then you can send media to them",
+        );
+      } else {
+        await ctx.reply(
+          "❌ Failed to forward document. Error: " +
+            (lastErrorDescription || "Unknown error"),
+        );
+      }
+    }
+  } catch (e: any) {
     if (e?.description?.includes("chat not found")) {
       await ctx.reply(
         "❌ Cannot send to target user.\n\n" +
@@ -2303,32 +2635,59 @@ bot.on("audio", async (ctx: Context) => {
     return ctx.reply("Error: audio message is undefined");
   }
 
-  const target = await findTarget(userId);
-  if (!target) {
+  const targets = await findTargets(userId);
+  if (!targets.length) {
     return ctx.reply(
       "❌ No target configured.\n" + "Use /set_target <user_id> first.",
     );
   }
 
   try {
-    await applyDelay(userId);
     const audio = message.audio;
-    const sent = await ctx.telegram.sendAudio(target, audio.file_id, {
-      caption: message.caption || undefined,
-    });
-    await saveForwardLog(userId, target, sent, "audio");
-    await sendToBackupIfEnabled(userId, target, "audio", () =>
+    const failedTargets: number[] = [];
+    let lastErrorDescription: string | undefined;
+
+    for (const target of targets) {
+      try {
+        await applyDelay(userId);
+        const sent = await ctx.telegram.sendAudio(target, audio.file_id, {
+          caption: message.caption || undefined,
+        });
+        await saveForwardLog(userId, target, sent, "audio");
+        console.log(`[AUDIO] Forwarded from ${userId} to ${target}`);
+      } catch (e: any) {
+        failedTargets.push(target);
+        lastErrorDescription = e?.description || e?.message;
+        console.error(
+          `[ERROR] Failed to forward audio from ${userId} to ${target}:`,
+          lastErrorDescription,
+        );
+      }
+    }
+
+    await sendToBackupForMultiIfEnabled(userId, targets, "audio", () =>
       ctx.telegram.sendAudio(getBackupTargetId()!, audio.file_id, {
         caption: message.caption || undefined,
       }),
     );
-    console.log(`[AUDIO] Forwarded from ${userId} to ${target}`);
-  } catch (e: any) {
-    console.error(
-      `[ERROR] Failed to forward audio from ${userId} to ${target}:`,
-      e?.description || e?.message,
-    );
 
+    if (failedTargets.length === targets.length) {
+      if (lastErrorDescription?.includes("chat not found")) {
+        await ctx.reply(
+          "❌ Cannot send to target user.\n\n" +
+            "The recipient must start the bot first:\n" +
+            "1. They need to search for this bot\n" +
+            "2. Click /start\n" +
+            "3. Then you can send media to them",
+        );
+      } else {
+        await ctx.reply(
+          "❌ Failed to forward audio. Error: " +
+            (lastErrorDescription || "Unknown error"),
+        );
+      }
+    }
+  } catch (e: any) {
     if (e?.description?.includes("chat not found")) {
       await ctx.reply(
         "❌ Cannot send to target user.\n\n" +
@@ -2367,28 +2726,58 @@ bot.on("video_note", async (ctx: Context) => {
     return ctx.reply("Error: video_note message is undefined");
   }
 
-  const target = await findTarget(userId);
-  if (!target) {
+  const targets = await findTargets(userId);
+  if (!targets.length) {
     return ctx.reply(
       "❌ No target configured.\n" + "Use /set_target <user_id> first.",
     );
   }
 
   try {
-    await applyDelay(userId);
     const videoNote = message.video_note;
-    const sent = await ctx.telegram.sendVideoNote(target, videoNote.file_id);
-    await saveForwardLog(userId, target, sent, "video_note");
-    await sendToBackupIfEnabled(userId, target, "video_note", () =>
+    const failedTargets: number[] = [];
+    let lastErrorDescription: string | undefined;
+
+    for (const target of targets) {
+      try {
+        await applyDelay(userId);
+        const sent = await ctx.telegram.sendVideoNote(
+          target,
+          videoNote.file_id,
+        );
+        await saveForwardLog(userId, target, sent, "video_note");
+        console.log(`[VIDEO_NOTE] Forwarded from ${userId} to ${target}`);
+      } catch (e: any) {
+        failedTargets.push(target);
+        lastErrorDescription = e?.description || e?.message;
+        console.error(
+          `[ERROR] Failed to forward video note from ${userId} to ${target}:`,
+          lastErrorDescription,
+        );
+      }
+    }
+
+    await sendToBackupForMultiIfEnabled(userId, targets, "video_note", () =>
       ctx.telegram.sendVideoNote(getBackupTargetId()!, videoNote.file_id),
     );
-    console.log(`[VIDEO_NOTE] Forwarded from ${userId} to ${target}`);
-  } catch (e: any) {
-    console.error(
-      `[ERROR] Failed to forward video note from ${userId} to ${target}:`,
-      e?.description || e?.message,
-    );
 
+    if (failedTargets.length === targets.length) {
+      if (lastErrorDescription?.includes("chat not found")) {
+        await ctx.reply(
+          "❌ Cannot send to target user.\n\n" +
+            "The recipient must start the bot first:\n" +
+            "1. They need to search for this bot\n" +
+            "2. Click /start\n" +
+            "3. Then you can send media to them",
+        );
+      } else {
+        await ctx.reply(
+          "❌ Failed to forward video note. Error: " +
+            (lastErrorDescription || "Unknown error"),
+        );
+      }
+    }
+  } catch (e: any) {
     if (e?.description?.includes("chat not found")) {
       await ctx.reply(
         "❌ Cannot send to target user.\n\n" +
@@ -2464,6 +2853,130 @@ bot.action(/^(set|change)_target_(\d+)$/, async (ctx: Context) => {
   }
 });
 
+bot.action(/^multi_target_toggle_(\d+)$/, async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const selected = pendingMultiTargetSelections.get(userId);
+  if (!selected) {
+    return ctx.answerCbQuery(
+      "No hay una selección activa. Usa /set_multi_target.",
+      { show_alert: true },
+    );
+  }
+
+  const match = (ctx as any).match as RegExpExecArray;
+  const targetId = Number(match[1]);
+
+  if (targetId === userId) {
+    return ctx.answerCbQuery("No puedes seleccionarte a ti mismo.", {
+      show_alert: true,
+    });
+  }
+
+  if (selected.has(targetId)) {
+    selected.delete(targetId);
+  } else {
+    selected.add(targetId);
+  }
+
+  const filtered = await getSelectableTargetsForUser(userId);
+  pendingMultiTargetSelections.set(userId, selected);
+
+  await ctx.editMessageText(buildMultiTargetPrompt(selected.size), {
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: buildMultiTargetKeyboard(filtered, selected),
+    },
+  });
+
+  return ctx.answerCbQuery();
+});
+
+bot.action("multi_target_clear", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const selected = pendingMultiTargetSelections.get(userId);
+  if (!selected) {
+    return ctx.answerCbQuery(
+      "No hay una selección activa. Usa /set_multi_target.",
+      { show_alert: true },
+    );
+  }
+
+  selected.clear();
+  const filtered = await getSelectableTargetsForUser(userId);
+  pendingMultiTargetSelections.set(userId, selected);
+
+  await ctx.editMessageText(buildMultiTargetPrompt(0), {
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: buildMultiTargetKeyboard(filtered, selected),
+    },
+  });
+
+  return ctx.answerCbQuery("Selección limpiada");
+});
+
+bot.action("multi_target_cancel", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  pendingMultiTargetSelections.delete(userId);
+  await ctx.editMessageText("❌ Selección múltiple cancelada.");
+  return ctx.answerCbQuery();
+});
+
+bot.action("multi_target_accept", async (ctx: Context) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const selected = pendingMultiTargetSelections.get(userId);
+  if (!selected) {
+    return ctx.answerCbQuery(
+      "No hay una selección activa. Usa /set_multi_target.",
+      { show_alert: true },
+    );
+  }
+
+  const selectedIds = Array.from(selected.values());
+  if (!selectedIds.length) {
+    return ctx.answerCbQuery(
+      "Selecciona al menos un usuario antes de aceptar.",
+      { show_alert: true },
+    );
+  }
+
+  await setTargets(userId, selectedIds);
+  pendingMultiTargetSelections.delete(userId);
+
+  const lines: string[] = [];
+  for (let i = 0; i < selectedIds.length; i++) {
+    const targetId = selectedIds[i];
+    try {
+      const info = await bot.telegram.getChat(targetId);
+      const username = (info as any).username
+        ? `@${(info as any).username}`
+        : "N/A";
+      const firstName = (info as any).first_name || "Unknown";
+      lines.push(
+        `${i + 1}. ${firstName} (${username}) - <code>${targetId}</code>`,
+      );
+    } catch (error) {
+      lines.push(`${i + 1}. <code>${targetId}</code>`);
+    }
+  }
+
+  await ctx.editMessageText(
+    "✅ <b>Destinatarios múltiples configurados</b>\n\n" +
+      `${lines.join("\n")}`,
+    { parse_mode: "HTML" },
+  );
+
+  return ctx.answerCbQuery("Configuración guardada");
+});
+
 // Launch bot with dropPendingUpdates
 bot.launch({
   dropPendingUpdates: true,
@@ -2484,6 +2997,10 @@ bot.telegram
   .setMyCommands([
     { command: "start", description: "Start registration / open bot" },
     { command: "set_target", description: "<id> - Set media recipient" },
+    {
+      command: "set_multi_target",
+      description: "Select multiple media recipients",
+    },
     { command: "get_target", description: "Show current recipient" },
     { command: "change_target", description: "<id> - Update recipient" },
     { command: "status", description: "Check bot status" },
